@@ -14,1807 +14,1345 @@
  *    limitations under the License.
  */
 
-package com.netflix.discovery;
+package com.netflix.eureka.registry;
 
-import static com.netflix.discovery.EurekaClientNames.METRIC_REGISTRATION_PREFIX;
-import static com.netflix.discovery.EurekaClientNames.METRIC_REGISTRY_PREFIX;
-
+import javax.annotation.Nullable;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.AbstractQueue;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Map.Entry;
+import java.util.Random;
 import java.util.Set;
-import java.util.TreeMap;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import javax.annotation.Nullable;
-import javax.annotation.PreDestroy;
-import javax.inject.Provider;
-import javax.inject.Singleton;
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.SSLContext;
-import javax.ws.rs.core.Response.Status;
-
-import com.netflix.discovery.shared.resolver.EndpointRandomizer;
-import com.netflix.discovery.shared.resolver.ResolverUtils;
-import org.apache.commons.lang.exception.ExceptionUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Strings;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import com.google.inject.Inject;
-import com.netflix.appinfo.ApplicationInfoManager;
-import com.netflix.appinfo.HealthCheckCallback;
-import com.netflix.appinfo.HealthCheckCallbackToHandlerBridge;
-import com.netflix.appinfo.HealthCheckHandler;
+import com.google.common.cache.CacheBuilder;
 import com.netflix.appinfo.InstanceInfo;
 import com.netflix.appinfo.InstanceInfo.ActionType;
 import com.netflix.appinfo.InstanceInfo.InstanceStatus;
-import com.netflix.discovery.endpoint.EndpointUtils;
+import com.netflix.appinfo.LeaseInfo;
+import com.netflix.discovery.EurekaClientConfig;
 import com.netflix.discovery.shared.Application;
 import com.netflix.discovery.shared.Applications;
-import com.netflix.discovery.shared.resolver.ClosableResolver;
-import com.netflix.discovery.shared.resolver.aws.ApplicationsResolver;
-import com.netflix.discovery.shared.transport.EurekaHttpClient;
-import com.netflix.discovery.shared.transport.EurekaHttpClientFactory;
-import com.netflix.discovery.shared.transport.EurekaHttpClients;
-import com.netflix.discovery.shared.transport.EurekaHttpResponse;
-import com.netflix.discovery.shared.transport.EurekaTransportConfig;
-import com.netflix.discovery.shared.transport.TransportClientFactory;
-import com.netflix.discovery.shared.transport.jersey.EurekaJerseyClient;
-import com.netflix.discovery.shared.transport.jersey.Jersey1DiscoveryClientOptionalArgs;
-import com.netflix.discovery.shared.transport.jersey.Jersey1TransportClientFactories;
-import com.netflix.discovery.shared.transport.jersey.TransportClientFactories;
-import com.netflix.discovery.util.ThresholdLevelsMetric;
+import com.netflix.discovery.shared.Pair;
+import com.netflix.eureka.EurekaServerConfig;
+import com.netflix.eureka.lease.Lease;
+import com.netflix.eureka.registry.rule.InstanceStatusOverrideRule;
+import com.netflix.eureka.resources.ServerCodecs;
+import com.netflix.eureka.util.MeasuredRate;
 import com.netflix.servo.annotations.DataSourceType;
-import com.netflix.servo.monitor.Counter;
-import com.netflix.servo.monitor.Monitors;
-import com.netflix.servo.monitor.Stopwatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static com.netflix.eureka.util.EurekaMonitors.*;
 
 /**
- * The class that is instrumental for interactions with <tt>Eureka Server</tt>.
+ * Handles all registry requests from eureka clients.
  *
  * <p>
- * <tt>Eureka Client</tt> is responsible for a) <em>Registering</em> the
- * instance with <tt>Eureka Server</tt> b) <em>Renewal</em>of the lease with
- * <tt>Eureka Server</tt> c) <em>Cancellation</em> of the lease from
- * <tt>Eureka Server</tt> during shutdown
- * <p>
- * d) <em>Querying</em> the list of services/instances registered with
- * <tt>Eureka Server</tt>
- * <p>
- *
- * <p>
- * <tt>Eureka Client</tt> needs a configured list of <tt>Eureka Server</tt>
- * {@link java.net.URL}s to talk to.These {@link java.net.URL}s are typically amazon elastic eips
- * which do not change. All of the functions defined above fail-over to other
- * {@link java.net.URL}s specified in the list in the case of failure.
+ * Primary operations that are performed are the
+ * <em>Registers</em>, <em>Renewals</em>, <em>Cancels</em>, <em>Expirations</em>, and <em>Status Changes</em>. The
+ * registry also stores only the delta operations
  * </p>
  *
- * @author Karthik Ranganathan, Greg Kim
- * @author Spencer Gibb
+ * @author Karthik Ranganathan
  *
  */
-@Singleton
-public class DiscoveryClient implements EurekaClient {
-    private static final Logger logger = LoggerFactory.getLogger(DiscoveryClient.class);
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    private static final Logger logger = LoggerFactory.getLogger(AbstractInstanceRegistry.class);
 
-    // Constants
-    public static final String HTTP_X_DISCOVERY_ALLOW_REDIRECT = "X-Discovery-AllowRedirect";
+    private static final String[] EMPTY_STR_ARRAY = new String[0];
+    private final ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>> registry
+            = new ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>>();
+    protected Map<String, RemoteRegionRegistry> regionNameVSRemoteRegistry = new HashMap<String, RemoteRegionRegistry>();
+    protected final ConcurrentMap<String, InstanceStatus> overriddenInstanceStatusMap = CacheBuilder
+            .newBuilder().initialCapacity(500)
+            .expireAfterAccess(1, TimeUnit.HOURS)
+            .<String, InstanceStatus>build().asMap();
 
-    private static final String VALUE_DELIMITER = ",";
-    private static final String COMMA_STRING = VALUE_DELIMITER;
+    // CircularQueues here for debugging/statistics purposes only
+    private final CircularQueue<Pair<Long, String>> recentRegisteredQueue;
+    private final CircularQueue<Pair<Long, String>> recentCanceledQueue;
+    private ConcurrentLinkedQueue<RecentlyChangedItem> recentlyChangedQueue = new ConcurrentLinkedQueue<RecentlyChangedItem>();
 
-    /**
-     * @deprecated here for legacy support as the client config has moved to be an instance variable
-     */
-    @Deprecated
-    private static EurekaClientConfig staticClientConfig;
+    private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+    private final Lock read = readWriteLock.readLock();
+    private final Lock write = readWriteLock.writeLock();
+    protected final Object lock = new Object();
 
-    // Timers
-    private static final String PREFIX = "DiscoveryClient_";
-    private final Counter RECONCILE_HASH_CODES_MISMATCH = Monitors.newCounter(PREFIX + "ReconcileHashCodeMismatch");
-    private final com.netflix.servo.monitor.Timer FETCH_REGISTRY_TIMER = Monitors
-            .newTimer(PREFIX + "FetchRegistry");
-    private final Counter REREGISTER_COUNTER = Monitors.newCounter(PREFIX
-            + "Reregister");
+    private Timer deltaRetentionTimer = new Timer("Eureka-DeltaRetentionTimer", true);
+    private Timer evictionTimer = new Timer("Eureka-EvictionTimer", true);
+    private final MeasuredRate renewsLastMin;
 
-    // instance variables
-    /**
-     * A scheduler to be used for the following 3 tasks:
-     * - updating service urls
-     * - scheduling a TimedSuperVisorTask
-     */
-    private final ScheduledExecutorService scheduler;
-    // additional executors for supervised subtasks
-    private final ThreadPoolExecutor heartbeatExecutor;
-    private final ThreadPoolExecutor cacheRefreshExecutor;
+    private final AtomicReference<EvictionTask> evictionTaskRef = new AtomicReference<EvictionTask>();
 
-    private TimedSupervisorTask cacheRefreshTask;
-    private TimedSupervisorTask heartbeatTask;
+    protected String[] allKnownRemoteRegions = EMPTY_STR_ARRAY;
+    protected volatile int numberOfRenewsPerMinThreshold;
+    protected volatile int expectedNumberOfClientsSendingRenews;
 
-    private final Provider<HealthCheckHandler> healthCheckHandlerProvider;
-    private final Provider<HealthCheckCallback> healthCheckCallbackProvider;
-    private final PreRegistrationHandler preRegistrationHandler;
-    private final AtomicReference<Applications> localRegionApps = new AtomicReference<Applications>();
-    private final Lock fetchRegistryUpdateLock = new ReentrantLock();
-    // monotonically increasing generation counter to ensure stale threads do not reset registry to an older version
-    private final AtomicLong fetchRegistryGeneration;
-    private final ApplicationInfoManager applicationInfoManager;
-    private final InstanceInfo instanceInfo;
-    private final AtomicReference<String> remoteRegionsToFetch;
-    private final AtomicReference<String[]> remoteRegionsRef;
-    private final InstanceRegionChecker instanceRegionChecker;
-
-    private final EndpointUtils.ServiceUrlRandomizer urlRandomizer;
-    private final EndpointRandomizer endpointRandomizer;
-    private final Provider<BackupRegistry> backupRegistryProvider;
-    private final EurekaTransport eurekaTransport;
-
-    private final AtomicReference<HealthCheckHandler> healthCheckHandlerRef = new AtomicReference<>();
-    private volatile Map<String, Applications> remoteRegionVsApps = new ConcurrentHashMap<>();
-    private volatile InstanceInfo.InstanceStatus lastRemoteInstanceStatus = InstanceInfo.InstanceStatus.UNKNOWN;
-    private final CopyOnWriteArraySet<EurekaEventListener> eventListeners = new CopyOnWriteArraySet<>();
-
-    private String appPathIdentifier;
-    private ApplicationInfoManager.StatusChangeListener statusChangeListener;
-
-    private InstanceInfoReplicator instanceInfoReplicator;
-
-    private volatile int registrySize = 0;
-    private volatile long lastSuccessfulRegistryFetchTimestamp = -1;
-    private volatile long lastSuccessfulHeartbeatTimestamp = -1;
-    private final ThresholdLevelsMetric heartbeatStalenessMonitor;
-    private final ThresholdLevelsMetric registryStalenessMonitor;
-
-    private final AtomicBoolean isShutdown = new AtomicBoolean(false);
-
+    protected final EurekaServerConfig serverConfig;
     protected final EurekaClientConfig clientConfig;
-    protected final EurekaTransportConfig transportConfig;
-
-    private final long initTimestampMs;
-    private final int initRegistrySize;
-
-    private final Stats stats = new Stats();
-
-    private static final class EurekaTransport {
-        private ClosableResolver bootstrapResolver;
-        private TransportClientFactory transportClientFactory;
-
-        private EurekaHttpClient registrationClient;
-        private EurekaHttpClientFactory registrationClientFactory;
-
-        private EurekaHttpClient queryClient;
-        private EurekaHttpClientFactory queryClientFactory;
-
-        void shutdown() {
-            if (registrationClientFactory != null) {
-                registrationClientFactory.shutdown();
-            }
-
-            if (queryClientFactory != null) {
-                queryClientFactory.shutdown();
-            }
-
-            if (registrationClient != null) {
-                registrationClient.shutdown();
-            }
-
-            if (queryClient != null) {
-                queryClient.shutdown();
-            }
-
-            if (transportClientFactory != null) {
-                transportClientFactory.shutdown();
-            }
-
-            if (bootstrapResolver != null) {
-                bootstrapResolver.shutdown();
-            }
-        }
-    }
-
-    public static class DiscoveryClientOptionalArgs extends Jersey1DiscoveryClientOptionalArgs {
-
-    }
+    protected final ServerCodecs serverCodecs;
+    protected volatile ResponseCache responseCache;
 
     /**
-     * Assumes applicationInfoManager is already initialized
-     *
-     * @deprecated use constructor that takes ApplicationInfoManager instead of InstanceInfo directly
+     * Create a new, empty instance registry.
      */
-    @Deprecated
-    public DiscoveryClient(InstanceInfo myInfo, EurekaClientConfig config) {
-        this(myInfo, config, null);
+    protected AbstractInstanceRegistry(EurekaServerConfig serverConfig, EurekaClientConfig clientConfig, ServerCodecs serverCodecs) {
+        this.serverConfig = serverConfig;
+        this.clientConfig = clientConfig;
+        this.serverCodecs = serverCodecs;
+        this.recentCanceledQueue = new CircularQueue<Pair<Long, String>>(1000);
+        this.recentRegisteredQueue = new CircularQueue<Pair<Long, String>>(1000);
+
+        this.renewsLastMin = new MeasuredRate(1000 * 60 * 1);
+
+        this.deltaRetentionTimer.schedule(getDeltaRetentionTask(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs());
     }
 
-    /**
-     * Assumes applicationInfoManager is already initialized
-     *
-     * @deprecated use constructor that takes ApplicationInfoManager instead of InstanceInfo directly
-     */
-    @Deprecated
-    public DiscoveryClient(InstanceInfo myInfo, EurekaClientConfig config, DiscoveryClientOptionalArgs args) {
-        this(ApplicationInfoManager.getInstance(), config, args);
+    @Override
+    public synchronized void initializedResponseCache() {
+        if (responseCache == null) {
+            responseCache = new ResponseCacheImpl(serverConfig, serverCodecs, this);
+        }
     }
 
-    /**
-     * @deprecated use constructor that takes ApplicationInfoManager instead of InstanceInfo directly
-     */
-    @Deprecated
-    public DiscoveryClient(InstanceInfo myInfo, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args) {
-        this(ApplicationInfoManager.getInstance(), config, args);
-    }
-
-    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config) {
-        this(applicationInfoManager, config, null);
-    }
-
-    /**
-     * @deprecated use the version that take {@link com.netflix.discovery.AbstractDiscoveryClientOptionalArgs} instead
-     */
-    @Deprecated
-    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, DiscoveryClientOptionalArgs args) {
-        this(applicationInfoManager, config, (AbstractDiscoveryClientOptionalArgs) args);
-    }
-
-    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args) {
-        this(applicationInfoManager, config, args, ResolverUtils::randomize);
-    }
-
-    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args, EndpointRandomizer randomizer) {
-        this(applicationInfoManager, config, args, new Provider<BackupRegistry>() {
-            private volatile BackupRegistry backupRegistryInstance;
-
-            @Override
-            public synchronized BackupRegistry get() {
-                if (backupRegistryInstance == null) {
-                    String backupRegistryClassName = config.getBackupRegistryImpl();
-                    if (null != backupRegistryClassName) {
-                        try {
-                            backupRegistryInstance = (BackupRegistry) Class.forName(backupRegistryClassName).newInstance();
-                            logger.info("Enabled backup registry of type {}", backupRegistryInstance.getClass());
-                        } catch (InstantiationException e) {
-                            logger.error("Error instantiating BackupRegistry.", e);
-                        } catch (IllegalAccessException e) {
-                            logger.error("Error instantiating BackupRegistry.", e);
-                        } catch (ClassNotFoundException e) {
-                            logger.error("Error instantiating BackupRegistry.", e);
-                        }
-                    }
-
-                    if (backupRegistryInstance == null) {
-                        logger.warn("Using default backup registry implementation which does not do anything.");
-                        backupRegistryInstance = new NotImplementedRegistryImpl();
-                    }
-                }
-
-                return backupRegistryInstance;
-            }
-        }, randomizer);
-    }
-
-    /**
-     * @deprecated Use {@link #DiscoveryClient(ApplicationInfoManager, EurekaClientConfig, AbstractDiscoveryClientOptionalArgs, Provider<BackupRegistry>, EndpointRandomizer)}
-     */
-    @Deprecated
-    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
-                    Provider<BackupRegistry> backupRegistryProvider) {
-        this(applicationInfoManager, config, args, backupRegistryProvider, ResolverUtils::randomize);
-    }
-    
-    @Inject
-    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
-                    Provider<BackupRegistry> backupRegistryProvider, EndpointRandomizer endpointRandomizer) {
-        if (args != null) {
-            this.healthCheckHandlerProvider = args.healthCheckHandlerProvider;
-            this.healthCheckCallbackProvider = args.healthCheckCallbackProvider;
-            this.eventListeners.addAll(args.getEventListeners());
-            this.preRegistrationHandler = args.preRegistrationHandler;
-        } else {
-            this.healthCheckCallbackProvider = null;
-            this.healthCheckHandlerProvider = null;
-            this.preRegistrationHandler = null;
-        }
-        
-        this.applicationInfoManager = applicationInfoManager;
-        InstanceInfo myInfo = applicationInfoManager.getInfo();
-
-        clientConfig = config;
-        staticClientConfig = clientConfig;
-        transportConfig = config.getTransportConfig();
-        instanceInfo = myInfo;
-        if (myInfo != null) {
-            appPathIdentifier = instanceInfo.getAppName() + "/" + instanceInfo.getId();
-        } else {
-            logger.warn("Setting instanceInfo to a passed in null value");
-        }
-
-        this.backupRegistryProvider = backupRegistryProvider;
-        this.endpointRandomizer = endpointRandomizer;
-        this.urlRandomizer = new EndpointUtils.InstanceInfoBasedUrlRandomizer(instanceInfo);
-        localRegionApps.set(new Applications());
-
-        fetchRegistryGeneration = new AtomicLong(0);
-
-        remoteRegionsToFetch = new AtomicReference<String>(clientConfig.fetchRegistryForRemoteRegions());
-        remoteRegionsRef = new AtomicReference<>(remoteRegionsToFetch.get() == null ? null : remoteRegionsToFetch.get().split(","));
-
-        if (config.shouldFetchRegistry()) {
-            this.registryStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRY_PREFIX + "lastUpdateSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
-        } else {
-            this.registryStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
-        }
-
-        if (config.shouldRegisterWithEureka()) {
-            this.heartbeatStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRATION_PREFIX + "lastHeartbeatSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
-        } else {
-            this.heartbeatStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
-        }
-
-        logger.info("Initializing Eureka in region {}", clientConfig.getRegion());
-
-        if (!config.shouldRegisterWithEureka() && !config.shouldFetchRegistry()) {
-            logger.info("Client configured to neither register nor query for data.");
-            scheduler = null;
-            heartbeatExecutor = null;
-            cacheRefreshExecutor = null;
-            eurekaTransport = null;
-            instanceRegionChecker = new InstanceRegionChecker(new PropertyBasedAzToRegionMapper(config), clientConfig.getRegion());
-
-            // This is a bit of hack to allow for existing code using DiscoveryManager.getInstance()
-            // to work with DI'd DiscoveryClient
-            DiscoveryManager.getInstance().setDiscoveryClient(this);
-            DiscoveryManager.getInstance().setEurekaClientConfig(config);
-
-            initTimestampMs = System.currentTimeMillis();
-            initRegistrySize = this.getApplications().size();
-            registrySize = initRegistrySize;
-            logger.info("Discovery Client initialized at timestamp {} with initial instances count: {}",
-                    initTimestampMs, initRegistrySize);
-
-            return;  // no need to setup up an network tasks and we are done
-        }
-
-        try {
-            // default size of 2 - 1 each for heartbeat and cacheRefresh
-            scheduler = Executors.newScheduledThreadPool(2,
-                    new ThreadFactoryBuilder()
-                            .setNameFormat("DiscoveryClient-%d")
-                            .setDaemon(true)
-                            .build());
-
-            heartbeatExecutor = new ThreadPoolExecutor(
-                    1, clientConfig.getHeartbeatExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
-                    new SynchronousQueue<Runnable>(),
-                    new ThreadFactoryBuilder()
-                            .setNameFormat("DiscoveryClient-HeartbeatExecutor-%d")
-                            .setDaemon(true)
-                            .build()
-            );  // use direct handoff
-
-            cacheRefreshExecutor = new ThreadPoolExecutor(
-                    1, clientConfig.getCacheRefreshExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
-                    new SynchronousQueue<Runnable>(),
-                    new ThreadFactoryBuilder()
-                            .setNameFormat("DiscoveryClient-CacheRefreshExecutor-%d")
-                            .setDaemon(true)
-                            .build()
-            );  // use direct handoff
-
-            eurekaTransport = new EurekaTransport();
-            scheduleServerEndpointTask(eurekaTransport, args);
-
-            AzToRegionMapper azToRegionMapper;
-            if (clientConfig.shouldUseDnsForFetchingServiceUrls()) {
-                azToRegionMapper = new DNSBasedAzToRegionMapper(clientConfig);
-            } else {
-                azToRegionMapper = new PropertyBasedAzToRegionMapper(clientConfig);
-            }
-            if (null != remoteRegionsToFetch.get()) {
-                azToRegionMapper.setRegionsToFetch(remoteRegionsToFetch.get().split(","));
-            }
-            instanceRegionChecker = new InstanceRegionChecker(azToRegionMapper, clientConfig.getRegion());
-        } catch (Throwable e) {
-            throw new RuntimeException("Failed to initialize DiscoveryClient!", e);
-        }
-
-        if (clientConfig.shouldFetchRegistry()) {
-            try {
-                boolean primaryFetchRegistryResult = fetchRegistry(false);
-                if (!primaryFetchRegistryResult) {
-                    logger.info("Initial registry fetch from primary servers failed");
-                }
-                boolean backupFetchRegistryResult = true;
-                if (!primaryFetchRegistryResult && !fetchRegistryFromBackup()) {
-                    backupFetchRegistryResult = false;
-                    logger.info("Initial registry fetch from backup servers failed");
-                }
-                if (!primaryFetchRegistryResult && !backupFetchRegistryResult && clientConfig.shouldEnforceFetchRegistryAtInit()) {
-                    throw new IllegalStateException("Fetch registry error at startup. Initial fetch failed.");
-                }
-            } catch (Throwable th) {
-                logger.error("Fetch registry error at startup: {}", th.getMessage());
-                throw new IllegalStateException(th);
-            }
-        }
-
-        // call and execute the pre registration handler before all background tasks (inc registration) is started
-        if (this.preRegistrationHandler != null) {
-            this.preRegistrationHandler.beforeRegistration();
-        }
-
-        if (clientConfig.shouldRegisterWithEureka() && clientConfig.shouldEnforceRegistrationAtInit()) {
-            try {
-                if (!register() ) {
-                    throw new IllegalStateException("Registration error at startup. Invalid server response.");
-                }
-            } catch (Throwable th) {
-                logger.error("Registration error at startup: {}", th.getMessage());
-                throw new IllegalStateException(th);
-            }
-        }
-
-        // finally, init the schedule tasks (e.g. cluster resolvers, heartbeat, instanceInfo replicator, fetch
-        initScheduledTasks();
-
-        try {
-            Monitors.registerObject(this);
-        } catch (Throwable e) {
-            logger.warn("Cannot register timers", e);
-        }
-
-        // This is a bit of hack to allow for existing code using DiscoveryManager.getInstance()
-        // to work with DI'd DiscoveryClient
-        DiscoveryManager.getInstance().setDiscoveryClient(this);
-        DiscoveryManager.getInstance().setEurekaClientConfig(config);
-
-        initTimestampMs = System.currentTimeMillis();
-        initRegistrySize = this.getApplications().size();
-        registrySize = initRegistrySize;
-        logger.info("Discovery Client initialized at timestamp {} with initial instances count: {}",
-                initTimestampMs, initRegistrySize);
-    }
-
-    private void scheduleServerEndpointTask(EurekaTransport eurekaTransport,
-                                            AbstractDiscoveryClientOptionalArgs args) {
-
-            
-        Collection<?> additionalFilters = args == null
-                ? Collections.emptyList()
-                : args.additionalFilters;
-
-        EurekaJerseyClient providedJerseyClient = args == null
-                ? null
-                : args.eurekaJerseyClient;
-        
-        TransportClientFactories argsTransportClientFactories = null;
-        if (args != null && args.getTransportClientFactories() != null) {
-            argsTransportClientFactories = args.getTransportClientFactories();
-        }
-        
-        // Ignore the raw types warnings since the client filter interface changed between jersey 1/2
-        @SuppressWarnings("rawtypes")
-        TransportClientFactories transportClientFactories = argsTransportClientFactories == null
-                ? new Jersey1TransportClientFactories()
-                : argsTransportClientFactories;
-                
-        Optional<SSLContext> sslContext = args == null
-                ? Optional.empty()
-                : args.getSSLContext();
-        Optional<HostnameVerifier> hostnameVerifier = args == null
-                ? Optional.empty()
-                : args.getHostnameVerifier();
-
-        // If the transport factory was not supplied with args, assume they are using jersey 1 for passivity
-        eurekaTransport.transportClientFactory = providedJerseyClient == null
-                ? transportClientFactories.newTransportClientFactory(clientConfig, additionalFilters, applicationInfoManager.getInfo(), sslContext, hostnameVerifier)
-                : transportClientFactories.newTransportClientFactory(additionalFilters, providedJerseyClient);
-
-        ApplicationsResolver.ApplicationsSource applicationsSource = new ApplicationsResolver.ApplicationsSource() {
-            @Override
-            public Applications getApplications(int stalenessThreshold, TimeUnit timeUnit) {
-                long thresholdInMs = TimeUnit.MILLISECONDS.convert(stalenessThreshold, timeUnit);
-                long delay = getLastSuccessfulRegistryFetchTimePeriod();
-                if (delay > thresholdInMs) {
-                    logger.info("Local registry is too stale for local lookup. Threshold:{}, actual:{}",
-                            thresholdInMs, delay);
-                    return null;
-                } else {
-                    return localRegionApps.get();
-                }
-            }
-        };
-
-        eurekaTransport.bootstrapResolver = EurekaHttpClients.newBootstrapResolver(
-                clientConfig,
-                transportConfig,
-                eurekaTransport.transportClientFactory,
-                applicationInfoManager.getInfo(),
-                applicationsSource,
-                endpointRandomizer
-        );
-
-        if (clientConfig.shouldRegisterWithEureka()) {
-            EurekaHttpClientFactory newRegistrationClientFactory = null;
-            EurekaHttpClient newRegistrationClient = null;
-            try {
-                newRegistrationClientFactory = EurekaHttpClients.registrationClientFactory(
-                        eurekaTransport.bootstrapResolver,
-                        eurekaTransport.transportClientFactory,
-                        transportConfig
-                );
-                newRegistrationClient = newRegistrationClientFactory.newClient();
-            } catch (Exception e) {
-                logger.warn("Transport initialization failure", e);
-            }
-            eurekaTransport.registrationClientFactory = newRegistrationClientFactory;
-            eurekaTransport.registrationClient = newRegistrationClient;
-        }
-
-        // new method (resolve from primary servers for read)
-        // Configure new transport layer (candidate for injecting in the future)
-        if (clientConfig.shouldFetchRegistry()) {
-            EurekaHttpClientFactory newQueryClientFactory = null;
-            EurekaHttpClient newQueryClient = null;
-            try {
-                newQueryClientFactory = EurekaHttpClients.queryClientFactory(
-                        eurekaTransport.bootstrapResolver,
-                        eurekaTransport.transportClientFactory,
+    protected void initRemoteRegionRegistry() throws MalformedURLException {
+        Map<String, String> remoteRegionUrlsWithName = serverConfig.getRemoteRegionUrlsWithName();
+        if (!remoteRegionUrlsWithName.isEmpty()) {
+            allKnownRemoteRegions = new String[remoteRegionUrlsWithName.size()];
+            int remoteRegionArrayIndex = 0;
+            for (Map.Entry<String, String> remoteRegionUrlWithName : remoteRegionUrlsWithName.entrySet()) {
+                RemoteRegionRegistry remoteRegionRegistry = new RemoteRegionRegistry(
+                        serverConfig,
                         clientConfig,
-                        transportConfig,
-                        applicationInfoManager.getInfo(),
-                        applicationsSource,
-                        endpointRandomizer
-                );
-                newQueryClient = newQueryClientFactory.newClient();
-            } catch (Exception e) {
-                logger.warn("Transport initialization failure", e);
+                        serverCodecs,
+                        remoteRegionUrlWithName.getKey(),
+                        new URL(remoteRegionUrlWithName.getValue()));
+                regionNameVSRemoteRegistry.put(remoteRegionUrlWithName.getKey(), remoteRegionRegistry);
+                allKnownRemoteRegions[remoteRegionArrayIndex++] = remoteRegionUrlWithName.getKey();
             }
-            eurekaTransport.queryClientFactory = newQueryClientFactory;
-            eurekaTransport.queryClient = newQueryClient;
+        }
+        logger.info("Finished initializing remote region registries. All known remote regions: {}",
+                (Object) allKnownRemoteRegions);
+    }
+
+    @Override
+    public ResponseCache getResponseCache() {
+        return responseCache;
+    }
+
+    public long getLocalRegistrySize() {
+        long total = 0;
+        for (Map<String, Lease<InstanceInfo>> entry : registry.values()) {
+            total += entry.size();
+        }
+        return total;
+    }
+
+    /**
+     * Completely clear the registry.
+     */
+    @Override
+    public void clearRegistry() {
+        overriddenInstanceStatusMap.clear();
+        recentCanceledQueue.clear();
+        recentRegisteredQueue.clear();
+        recentlyChangedQueue.clear();
+        registry.clear();
+    }
+
+    // for server info use
+    @Override
+    public Map<String, InstanceStatus> overriddenInstanceStatusesSnapshot() {
+        return new HashMap<>(overriddenInstanceStatusMap);
+    }
+
+    /**
+     * Registers a new instance with a given duration.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#register(java.lang.Object, int, boolean)
+     */
+    public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
+        read.lock();
+        try {
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
+            REGISTER.increment(isReplication);
+            if (gMap == null) {
+                final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
+                gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
+                if (gMap == null) {
+                    gMap = gNewMap;
+                }
+            }
+            Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
+            // Retain the last dirty timestamp without overwriting it, if there is already a lease
+            if (existingLease != null && (existingLease.getHolder() != null)) {
+                Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
+                Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
+                logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+
+                // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
+                // InstanceInfo instead of the server local copy.
+                if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
+                    logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
+                            " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+                    logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
+                    registrant = existingLease.getHolder();
+                }
+            } else {
+                // The lease does not exist and hence it is a new registration
+                synchronized (lock) {
+                    if (this.expectedNumberOfClientsSendingRenews > 0) {
+                        // Since the client wants to register it, increase the number of clients sending renews
+                        this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
+                        updateRenewsPerMinThreshold();
+                    }
+                }
+                logger.debug("No previous lease information found; it is new registration");
+            }
+            Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);
+            if (existingLease != null) {
+                lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
+            }
+            gMap.put(registrant.getId(), lease);
+            recentRegisteredQueue.add(new Pair<Long, String>(
+                    System.currentTimeMillis(),
+                    registrant.getAppName() + "(" + registrant.getId() + ")"));
+            // This is where the initial state transfer of overridden status happens
+            if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
+                logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
+                                + "overrides", registrant.getOverriddenStatus(), registrant.getId());
+                if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {
+                    logger.info("Not found overridden id {} and hence adding it", registrant.getId());
+                    overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());
+                }
+            }
+            InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());
+            if (overriddenStatusFromMap != null) {
+                logger.info("Storing overridden status {} from map", overriddenStatusFromMap);
+                registrant.setOverriddenStatus(overriddenStatusFromMap);
+            }
+
+            // Set the status based on the overridden status rules
+            InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
+            registrant.setStatusWithoutDirty(overriddenInstanceStatus);
+
+            // If the lease is registered with UP status, set lease service up timestamp
+            if (InstanceStatus.UP.equals(registrant.getStatus())) {
+                lease.serviceUp();
+            }
+            registrant.setActionType(ActionType.ADDED);
+            recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+            registrant.setLastUpdatedTimestamp();
+            invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
+            logger.info("Registered instance {}/{} with status {} (replication={})",
+                    registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
+        } finally {
+            read.unlock();
         }
     }
 
+    /**
+     * Cancels the registration of an instance.
+     *
+     * <p>
+     * This is normally invoked by a client when it shuts down informing the
+     * server to remove the instance from traffic.
+     * </p>
+     *
+     * @param appName the application name of the application.
+     * @param id the unique identifier of the instance.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the instance was removed from the {@link AbstractInstanceRegistry} successfully, false otherwise.
+     */
     @Override
-    public EurekaClientConfig getEurekaClientConfig() {
-        return clientConfig;
+    public boolean cancel(String appName, String id, boolean isReplication) {
+        return internalCancel(appName, id, isReplication);
     }
 
-    @Override
-    public ApplicationInfoManager getApplicationInfoManager() {
-        return applicationInfoManager;
+    /**
+     * {@link #cancel(String, String, boolean)} method is overridden by {@link PeerAwareInstanceRegistry}, so each
+     * cancel request is replicated to the peers. This is however not desired for expires which would be counted
+     * in the remote peers as valid cancellations, so self preservation mode would not kick-in.
+     */
+    protected boolean internalCancel(String appName, String id, boolean isReplication) {
+        read.lock();
+        try {
+            CANCEL.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> leaseToCancel = null;
+            if (gMap != null) {
+                leaseToCancel = gMap.remove(id);
+            }
+            recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
+            InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
+            if (instanceStatus != null) {
+                logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
+            }
+            if (leaseToCancel == null) {
+                CANCEL_NOT_FOUND.increment(isReplication);
+                logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
+                return false;
+            } else {
+                leaseToCancel.cancel();
+                InstanceInfo instanceInfo = leaseToCancel.getHolder();
+                String vip = null;
+                String svip = null;
+                if (instanceInfo != null) {
+                    instanceInfo.setActionType(ActionType.DELETED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
+                    instanceInfo.setLastUpdatedTimestamp();
+                    vip = instanceInfo.getVIPAddress();
+                    svip = instanceInfo.getSecureVipAddress();
+                }
+                invalidateCache(appName, vip, svip);
+                logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
+            }
+        } finally {
+            read.unlock();
+        }
+
+        synchronized (lock) {
+            if (this.expectedNumberOfClientsSendingRenews > 0) {
+                // Since the client wants to cancel it, reduce the number of clients to send renews.
+                this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;
+                updateRenewsPerMinThreshold();
+            }
+        }
+
+        return true;
     }
 
-    /*
-     * (non-Javadoc)
+    /**
+     * Marks the given instance of the given app name as renewed, and also marks whether it originated from
+     * replication.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#renew(java.lang.String, java.lang.String, boolean)
+     */
+    public boolean renew(String appName, String id, boolean isReplication) {
+        RENEW.increment(isReplication);
+        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+        Lease<InstanceInfo> leaseToRenew = null;
+        if (gMap != null) {
+            leaseToRenew = gMap.get(id);
+        }
+        if (leaseToRenew == null) {
+            RENEW_NOT_FOUND.increment(isReplication);
+            logger.warn("DS: Registry: lease doesn't exist, registering resource: {} - {}", appName, id);
+            return false;
+        } else {
+            InstanceInfo instanceInfo = leaseToRenew.getHolder();
+            if (instanceInfo != null) {
+                // touchASGCache(instanceInfo.getASGName());
+                InstanceStatus overriddenInstanceStatus = this.getOverriddenInstanceStatus(
+                        instanceInfo, leaseToRenew, isReplication);
+                if (overriddenInstanceStatus == InstanceStatus.UNKNOWN) {
+                    logger.info("Instance status UNKNOWN possibly due to deleted override for instance {}"
+                            + "; re-register required", instanceInfo.getId());
+                    RENEW_NOT_FOUND.increment(isReplication);
+                    return false;
+                }
+                if (!instanceInfo.getStatus().equals(overriddenInstanceStatus)) {
+                    logger.info(
+                            "The instance status {} is different from overridden instance status {} for instance {}. "
+                                    + "Hence setting the status to overridden status", instanceInfo.getStatus().name(),
+                                    overriddenInstanceStatus.name(),
+                                    instanceInfo.getId());
+                    instanceInfo.setStatusWithoutDirty(overriddenInstanceStatus);
+
+                }
+            }
+            renewsLastMin.increment();
+            leaseToRenew.renew();
+            return true;
+        }
+    }
+
+    /**
+     * @deprecated this is expensive, try not to use. See if you can use
+     * {@link #storeOverriddenStatusIfRequired(String, String, InstanceStatus)} instead.
+     *
+     * Stores overridden status if it is not already there. This happens during
+     * a reconciliation process during renewal requests.
+     *
+     * @param id the unique identifier of the instance.
+     * @param overriddenStatus Overridden status if any.
+     */
+    @Deprecated
+    @Override
+    public void storeOverriddenStatusIfRequired(String id, InstanceStatus overriddenStatus) {
+        InstanceStatus instanceStatus = overriddenInstanceStatusMap.get(id);
+        if ((instanceStatus == null)
+                || (!overriddenStatus.equals(instanceStatus))) {
+            // We might not have the overridden status if the server got restarted -this will help us maintain
+            // the overridden state from the replica
+            logger.info(
+                    "Adding overridden status for instance id {} and the value is {}",
+                    id, overriddenStatus.name());
+            overriddenInstanceStatusMap.put(id, overriddenStatus);
+            List<InstanceInfo> instanceInfo = this.getInstancesById(id, false);
+            if ((instanceInfo != null) && (!instanceInfo.isEmpty())) {
+                instanceInfo.iterator().next().setOverriddenStatus(overriddenStatus);
+                logger.info(
+                        "Setting the overridden status for instance id {} and the value is {} ",
+                        id, overriddenStatus.name());
+
+            }
+        }
+    }
+
+    /**
+     * Stores overridden status if it is not already there. This happens during
+     * a reconciliation process during renewal requests.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param overriddenStatus overridden status if any.
+     */
+    @Override
+    public void storeOverriddenStatusIfRequired(String appName, String id, InstanceStatus overriddenStatus) {
+        InstanceStatus instanceStatus = overriddenInstanceStatusMap.get(id);
+        if ((instanceStatus == null) || (!overriddenStatus.equals(instanceStatus))) {
+            // We might not have the overridden status if the server got
+            // restarted -this will help us maintain the overridden state
+            // from the replica
+            logger.info("Adding overridden status for instance id {} and the value is {}",
+                    id, overriddenStatus.name());
+            overriddenInstanceStatusMap.put(id, overriddenStatus);
+            InstanceInfo instanceInfo = this.getInstanceByAppAndId(appName, id, false);
+            instanceInfo.setOverriddenStatus(overriddenStatus);
+            logger.info("Set the overridden status for instance (appname:{}, id:{}} and the value is {} ",
+                    appName, id, overriddenStatus.name());
+        }
+    }
+
+    /**
+     * Updates the status of an instance. Normally happens to put an instance
+     * between {@link InstanceStatus#OUT_OF_SERVICE} and
+     * {@link InstanceStatus#UP} to put the instance in and out of traffic.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param newStatus the new {@link InstanceStatus}.
+     * @param lastDirtyTimestamp last timestamp when this instance information was updated.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the status was successfully updated, false otherwise.
+     */
+    @Override
+    public boolean statusUpdate(String appName, String id,
+                                InstanceStatus newStatus, String lastDirtyTimestamp,
+                                boolean isReplication) {
+        read.lock();
+        try {
+            STATUS_UPDATE.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> lease = null;
+            if (gMap != null) {
+                lease = gMap.get(id);
+            }
+            if (lease == null) {
+                return false;
+            } else {
+                lease.renew();
+                InstanceInfo info = lease.getHolder();
+                // Lease is always created with its instance info object.
+                // This log statement is provided as a safeguard, in case this invariant is violated.
+                if (info == null) {
+                    logger.error("Found Lease without a holder for instance id {}", id);
+                }
+                if ((info != null) && !(info.getStatus().equals(newStatus))) {
+                    // Mark service as UP if needed
+                    if (InstanceStatus.UP.equals(newStatus)) {
+                        lease.serviceUp();
+                    }
+                    // This is NAC overridden status
+                    overriddenInstanceStatusMap.put(id, newStatus);
+                    // Set it for transfer of overridden status to replica on
+                    // replica start up
+                    info.setOverriddenStatus(newStatus);
+                    long replicaDirtyTimestamp = 0;
+                    info.setStatusWithoutDirty(newStatus);
+                    if (lastDirtyTimestamp != null) {
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
+                    }
+                    // If the replication's dirty timestamp is more than the existing one, just update
+                    // it to the replica's.
+                    if (replicaDirtyTimestamp > info.getLastDirtyTimestamp()) {
+                        info.setLastDirtyTimestamp(replicaDirtyTimestamp);
+                    }
+                    info.setActionType(ActionType.MODIFIED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+                    info.setLastUpdatedTimestamp();
+                    invalidateCache(appName, info.getVIPAddress(), info.getSecureVipAddress());
+                }
+                return true;
+            }
+        } finally {
+            read.unlock();
+        }
+    }
+
+    /**
+     * Removes status override for a give instance.
+     *
+     * @param appName the application name of the instance.
+     * @param id the unique identifier of the instance.
+     * @param newStatus the new {@link InstanceStatus}.
+     * @param lastDirtyTimestamp last timestamp when this instance information was updated.
+     * @param isReplication true if this is a replication event from other nodes, false
+     *                      otherwise.
+     * @return true if the status was successfully updated, false otherwise.
+     */
+    @Override
+    public boolean deleteStatusOverride(String appName, String id,
+                                        InstanceStatus newStatus,
+                                        String lastDirtyTimestamp,
+                                        boolean isReplication) {
+        read.lock();
+        try {
+            STATUS_OVERRIDE_DELETE.increment(isReplication);
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> lease = null;
+            if (gMap != null) {
+                lease = gMap.get(id);
+            }
+            if (lease == null) {
+                return false;
+            } else {
+                lease.renew();
+                InstanceInfo info = lease.getHolder();
+
+                // Lease is always created with its instance info object.
+                // This log statement is provided as a safeguard, in case this invariant is violated.
+                if (info == null) {
+                    logger.error("Found Lease without a holder for instance id {}", id);
+                }
+
+                InstanceStatus currentOverride = overriddenInstanceStatusMap.remove(id);
+                if (currentOverride != null && info != null) {
+                    info.setOverriddenStatus(InstanceStatus.UNKNOWN);
+                    info.setStatusWithoutDirty(newStatus);
+                    long replicaDirtyTimestamp = 0;
+                    if (lastDirtyTimestamp != null) {
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
+                    }
+                    // If the replication's dirty timestamp is more than the existing one, just update
+                    // it to the replica's.
+                    if (replicaDirtyTimestamp > info.getLastDirtyTimestamp()) {
+                        info.setLastDirtyTimestamp(replicaDirtyTimestamp);
+                    }
+                    info.setActionType(ActionType.MODIFIED);
+                    recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+                    info.setLastUpdatedTimestamp();
+                    invalidateCache(appName, info.getVIPAddress(), info.getSecureVipAddress());
+                }
+                return true;
+            }
+        } finally {
+            read.unlock();
+        }
+    }
+
+    /**
+     * Evicts everything in the instance registry that has expired, if expiry is enabled.
+     *
+     * @see com.netflix.eureka.lease.LeaseManager#evict()
+     */
+    @Override
+    public void evict() {
+        evict(0l);
+    }
+
+    public void evict(long additionalLeaseMs) {
+        logger.debug("Running the evict task");
+
+        if (!isLeaseExpirationEnabled()) {
+            logger.debug("DS: lease expiration is currently disabled.");
+            return;
+        }
+
+        // We collect first all expired items, to evict them in random order. For large eviction sets,
+        // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
+        // the impact should be evenly distributed across all applications.
+        List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
+            Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
+            if (leaseMap != null) {
+                for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {
+                    Lease<InstanceInfo> lease = leaseEntry.getValue();
+                    if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {
+                        expiredLeases.add(lease);
+                    }
+                }
+            }
+        }
+
+        // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
+        // triggering self-preservation. Without that we would wipe out full registry.
+        int registrySize = (int) getLocalRegistrySize();
+        int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
+        int evictionLimit = registrySize - registrySizeThreshold;
+
+        int toEvict = Math.min(expiredLeases.size(), evictionLimit);
+        if (toEvict > 0) {
+            logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
+
+            Random random = new Random(System.currentTimeMillis());
+            for (int i = 0; i < toEvict; i++) {
+                // Pick a random item (Knuth shuffle algorithm)
+                int next = i + random.nextInt(expiredLeases.size() - i);
+                Collections.swap(expiredLeases, i, next);
+                Lease<InstanceInfo> lease = expiredLeases.get(i);
+
+                String appName = lease.getHolder().getAppName();
+                String id = lease.getHolder().getId();
+                EXPIRED.increment();
+                logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+                internalCancel(appName, id, false);
+            }
+        }
+    }
+
+
+    /**
+     * Returns the given app that is in this instance only, falling back to other regions transparently only
+     * if specified in this client configuration.
+     *
+     * @param appName the application name of the application
+     * @return the application
+     *
      * @see com.netflix.discovery.shared.LookupService#getApplication(java.lang.String)
      */
     @Override
     public Application getApplication(String appName) {
-        return getApplications().getRegisteredApplications(appName);
+        boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+        return this.getApplication(appName, !disableTransparentFallback);
     }
 
-    /*
-     * (non-Javadoc)
+    /**
+     * Get application information.
+     *
+     * @param appName The name of the application
+     * @param includeRemoteRegion true, if we need to include applications from remote regions
+     *                            as indicated by the region {@link URL} by this property
+     *                            {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return the application
+     */
+    @Override
+    public Application getApplication(String appName, boolean includeRemoteRegion) {
+        Application app = null;
+
+        Map<String, Lease<InstanceInfo>> leaseMap = registry.get(appName);
+
+        if (leaseMap != null && leaseMap.size() > 0) {
+            for (Entry<String, Lease<InstanceInfo>> entry : leaseMap.entrySet()) {
+                if (app == null) {
+                    app = new Application(appName);
+                }
+                app.addInstance(decorateInstanceInfo(entry.getValue()));
+            }
+        } else if (includeRemoteRegion) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Application application = remoteRegistry.getApplication(appName);
+                if (application != null) {
+                    return application;
+                }
+            }
+        }
+        return app;
+    }
+
+    /**
+     * Get all applications in this instance registry, falling back to other regions if allowed in the Eureka config.
+     *
+     * @return the list of all known applications
      *
      * @see com.netflix.discovery.shared.LookupService#getApplications()
      */
-    @Override
     public Applications getApplications() {
-        return localRegionApps.get();
-    }
-
-    @Override
-    public Applications getApplicationsForARegion(@Nullable String region) {
-        if (instanceRegionChecker.isLocalRegion(region)) {
-            return localRegionApps.get();
+        boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+        if (disableTransparentFallback) {
+            return getApplicationsFromLocalRegionOnly();
         } else {
-            return remoteRegionVsApps.get(region);
+            return getApplicationsFromAllRemoteRegions();  // Behavior of falling back to remote region can be disabled.
         }
-    }
-
-    public Set<String> getAllKnownRegions() {
-        String localRegion = instanceRegionChecker.getLocalRegion();
-        if (!remoteRegionVsApps.isEmpty()) {
-            Set<String> regions = remoteRegionVsApps.keySet();
-            Set<String> toReturn = new HashSet<String>(regions);
-            toReturn.add(localRegion);
-            return toReturn;
-        } else {
-            return Collections.singleton(localRegion);
-        }
-    }
-
-    /*
-     * (non-Javadoc)
-     * @see com.netflix.discovery.shared.LookupService#getInstancesById(java.lang.String)
-     */
-    @Override
-    public List<InstanceInfo> getInstancesById(String id) {
-        List<InstanceInfo> instancesList = new ArrayList<>();
-        for (Application app : this.getApplications()
-                .getRegisteredApplications()) {
-            InstanceInfo instanceInfo = app.getByInstanceId(id);
-            if (instanceInfo != null) {
-                instancesList.add(instanceInfo);
-            }
-        }
-        return instancesList;
     }
 
     /**
-     * Register {@link HealthCheckCallback} with the eureka client.
+     * Returns applications including instances from all remote regions. <br/>
+     * Same as calling {@link #getApplicationsFromMultipleRegions(String[])} with a <code>null</code> argument.
+     */
+    public Applications getApplicationsFromAllRemoteRegions() {
+        return getApplicationsFromMultipleRegions(allKnownRemoteRegions);
+    }
+
+    /**
+     * Returns applications including instances from local region only. <br/>
+     * Same as calling {@link #getApplicationsFromMultipleRegions(String[])} with an empty array.
+     */
+    @Override
+    public Applications getApplicationsFromLocalRegionOnly() {
+        return getApplicationsFromMultipleRegions(EMPTY_STR_ARRAY);
+    }
+
+    /**
+     * This method will return applications with instances from all passed remote regions as well as the current region.
+     * Thus, this gives a union view of instances from multiple regions. <br/>
+     * The application instances for which this union will be done can be restricted to the names returned by
+     * {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} for every region. In case, there is no whitelist
+     * defined for a region, this method will also look for a global whitelist by passing <code>null</code> to the
+     * method {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} <br/>
+     * If you are not selectively requesting for a remote region, use {@link #getApplicationsFromAllRemoteRegions()}
+     * or {@link #getApplicationsFromLocalRegionOnly()}
      *
-     * Once registered, the eureka client will invoke the
-     * {@link HealthCheckCallback} in intervals specified by
-     * {@link EurekaClientConfig#getInstanceInfoReplicationIntervalSeconds()}.
+     * @param remoteRegions The remote regions for which the instances are to be queried. The instances may be limited
+     *                      by a whitelist as explained above. If <code>null</code> or empty no remote regions are
+     *                      included.
      *
-     * @param callback app specific healthcheck.
+     * @return The applications with instances from the passed remote regions as well as local region. The instances
+     * from remote regions can be only for certain whitelisted apps as explained above.
+     */
+    public Applications getApplicationsFromMultipleRegions(String[] remoteRegions) {
+
+        boolean includeRemoteRegion = null != remoteRegions && remoteRegions.length != 0;
+
+        logger.debug("Fetching applications registry with remote regions: {}, Regions argument {}",
+                includeRemoteRegion, remoteRegions);
+
+        if (includeRemoteRegion) {
+            GET_ALL_WITH_REMOTE_REGIONS_CACHE_MISS.increment();
+        } else {
+            GET_ALL_CACHE_MISS.increment();
+        }
+        Applications apps = new Applications();
+        apps.setVersion(1L);
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> entry : registry.entrySet()) {
+            Application app = null;
+
+            if (entry.getValue() != null) {
+                for (Entry<String, Lease<InstanceInfo>> stringLeaseEntry : entry.getValue().entrySet()) {
+                    Lease<InstanceInfo> lease = stringLeaseEntry.getValue();
+                    if (app == null) {
+                        app = new Application(lease.getHolder().getAppName());
+                    }
+                    app.addInstance(decorateInstanceInfo(lease));
+                }
+            }
+            if (app != null) {
+                apps.addApplication(app);
+            }
+        }
+        if (includeRemoteRegion) {
+            for (String remoteRegion : remoteRegions) {
+                RemoteRegionRegistry remoteRegistry = regionNameVSRemoteRegistry.get(remoteRegion);
+                if (null != remoteRegistry) {
+                    Applications remoteApps = remoteRegistry.getApplications();
+                    for (Application application : remoteApps.getRegisteredApplications()) {
+                        if (shouldFetchFromRemoteRegistry(application.getName(), remoteRegion)) {
+                            logger.info("Application {}  fetched from the remote region {}",
+                                    application.getName(), remoteRegion);
+
+                            Application appInstanceTillNow = apps.getRegisteredApplications(application.getName());
+                            if (appInstanceTillNow == null) {
+                                appInstanceTillNow = new Application(application.getName());
+                                apps.addApplication(appInstanceTillNow);
+                            }
+                            for (InstanceInfo instanceInfo : application.getInstances()) {
+                                appInstanceTillNow.addInstance(instanceInfo);
+                            }
+                        } else {
+                            logger.debug("Application {} not fetched from the remote region {} as there exists a "
+                                            + "whitelist and this app is not in the whitelist.",
+                                    application.getName(), remoteRegion);
+                        }
+                    }
+                } else {
+                    logger.warn("No remote registry available for the remote region {}", remoteRegion);
+                }
+            }
+        }
+        apps.setAppsHashCode(apps.getReconcileHashCode());
+        return apps;
+    }
+
+    private boolean shouldFetchFromRemoteRegistry(String appName, String remoteRegion) {
+        Set<String> whiteList = serverConfig.getRemoteRegionAppWhitelist(remoteRegion);
+        if (null == whiteList) {
+            whiteList = serverConfig.getRemoteRegionAppWhitelist(null); // see global whitelist.
+        }
+        return null == whiteList || whiteList.contains(appName);
+    }
+
+    /**
+     * Get the registry information about all {@link Applications}.
      *
-     * @deprecated Use
+     * @param includeRemoteRegion true, if we need to include applications from remote regions
+     *                            as indicated by the region {@link URL} by this property
+     *                            {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return applications
+     *
+     * @deprecated Use {@link #getApplicationsFromMultipleRegions(String[])} instead. This method has a flawed behavior
+     * of transparently falling back to a remote region if no instances for an app is available locally. The new
+     * behavior is to explicitly specify if you need a remote region.
      */
     @Deprecated
-    @Override
-    public void registerHealthCheckCallback(HealthCheckCallback callback) {
-        if (instanceInfo == null) {
-            logger.error("Cannot register a listener for instance info since it is null!");
-        }
-        if (callback != null) {
-            healthCheckHandlerRef.set(new HealthCheckCallbackToHandlerBridge(callback));
-        }
-    }
+    public Applications getApplications(boolean includeRemoteRegion) {
+        GET_ALL_CACHE_MISS.increment();
+        Applications apps = new Applications();
+        apps.setVersion(1L);
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> entry : registry.entrySet()) {
+            Application app = null;
 
-    @Override
-    public void registerHealthCheck(HealthCheckHandler healthCheckHandler) {
-        if (instanceInfo == null) {
-            logger.error("Cannot register a healthcheck handler when instance info is null!");
-        }
-        if (healthCheckHandler != null) {
-            this.healthCheckHandlerRef.set(healthCheckHandler);
-            // schedule an onDemand update of the instanceInfo when a new healthcheck handler is registered
-            if (instanceInfoReplicator != null) {
-                instanceInfoReplicator.onDemandUpdate();
-            }
-        }
-    }
+            if (entry.getValue() != null) {
+                for (Entry<String, Lease<InstanceInfo>> stringLeaseEntry : entry.getValue().entrySet()) {
 
-    @Override
-    public void registerEventListener(EurekaEventListener eventListener) {
-        this.eventListeners.add(eventListener);
-    }
+                    Lease<InstanceInfo> lease = stringLeaseEntry.getValue();
 
-    @Override
-    public boolean unregisterEventListener(EurekaEventListener eventListener) {
-        return this.eventListeners.remove(eventListener);
-    }
+                    if (app == null) {
+                        app = new Application(lease.getHolder().getAppName());
+                    }
 
-    /**
-     * Gets the list of instances matching the given VIP Address.
-     *
-     * @param vipAddress
-     *            - The VIP address to match the instances for.
-     * @param secure
-     *            - true if it is a secure vip address, false otherwise
-     * @return - The list of {@link InstanceInfo} objects matching the criteria
-     */
-    @Override
-    public List<InstanceInfo> getInstancesByVipAddress(String vipAddress, boolean secure) {
-        return getInstancesByVipAddress(vipAddress, secure, instanceRegionChecker.getLocalRegion());
-    }
-
-    /**
-     * Gets the list of instances matching the given VIP Address in the passed region.
-     *
-     * @param vipAddress - The VIP address to match the instances for.
-     * @param secure - true if it is a secure vip address, false otherwise
-     * @param region - region from which the instances are to be fetched. If <code>null</code> then local region is
-     *               assumed.
-     *
-     * @return - The list of {@link InstanceInfo} objects matching the criteria, empty list if not instances found.
-     */
-    @Override
-    public List<InstanceInfo> getInstancesByVipAddress(String vipAddress, boolean secure,
-                                                       @Nullable String region) {
-        if (vipAddress == null) {
-            throw new IllegalArgumentException(
-                    "Supplied VIP Address cannot be null");
-        }
-        Applications applications;
-        if (instanceRegionChecker.isLocalRegion(region)) {
-            applications = this.localRegionApps.get();
-        } else {
-            applications = remoteRegionVsApps.get(region);
-            if (null == applications) {
-                logger.debug("No applications are defined for region {}, so returning an empty instance list for vip "
-                        + "address {}.", region, vipAddress);
-                return Collections.emptyList();
-            }
-        }
-
-        if (!secure) {
-            return applications.getInstancesByVirtualHostName(vipAddress);
-        } else {
-            return applications.getInstancesBySecureVirtualHostName(vipAddress);
-
-        }
-
-    }
-
-    /**
-     * Gets the list of instances matching the given VIP Address and the given
-     * application name if both of them are not null. If one of them is null,
-     * then that criterion is completely ignored for matching instances.
-     *
-     * @param vipAddress
-     *            - The VIP address to match the instances for.
-     * @param appName
-     *            - The applicationName to match the instances for.
-     * @param secure
-     *            - true if it is a secure vip address, false otherwise.
-     * @return - The list of {@link InstanceInfo} objects matching the criteria.
-     */
-    @Override
-    public List<InstanceInfo> getInstancesByVipAddressAndAppName(
-            String vipAddress, String appName, boolean secure) {
-
-        List<InstanceInfo> result = new ArrayList<InstanceInfo>();
-        if (vipAddress == null && appName == null) {
-            throw new IllegalArgumentException(
-                    "Supplied VIP Address and application name cannot both be null");
-        } else if (vipAddress != null && appName == null) {
-            return getInstancesByVipAddress(vipAddress, secure);
-        } else if (vipAddress == null && appName != null) {
-            Application application = getApplication(appName);
-            if (application != null) {
-                result = application.getInstances();
-            }
-            return result;
-        }
-
-        String instanceVipAddress;
-        for (Application app : getApplications().getRegisteredApplications()) {
-            for (InstanceInfo instance : app.getInstances()) {
-                if (secure) {
-                    instanceVipAddress = instance.getSecureVipAddress();
-                } else {
-                    instanceVipAddress = instance.getVIPAddress();
+                    app.addInstance(decorateInstanceInfo(lease));
                 }
-                if (instanceVipAddress == null) {
+            }
+            if (app != null) {
+                apps.addApplication(app);
+            }
+        }
+        if (includeRemoteRegion) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Applications applications = remoteRegistry.getApplications();
+                for (Application application : applications
+                        .getRegisteredApplications()) {
+                    Application appInLocalRegistry = apps
+                            .getRegisteredApplications(application.getName());
+                    if (appInLocalRegistry == null) {
+                        apps.addApplication(application);
+                    }
+                }
+            }
+        }
+        apps.setAppsHashCode(apps.getReconcileHashCode());
+        return apps;
+    }
+
+    /**
+     * Get the registry information about the delta changes. The deltas are
+     * cached for a window specified by
+     * {@link EurekaServerConfig#getRetentionTimeInMSInDeltaQueue()}. Subsequent
+     * requests for delta information may return the same information and client
+     * must make sure this does not adversely affect them.
+     *
+     * @return all application deltas.
+     * @deprecated use {@link #getApplicationDeltasFromMultipleRegions(String[])} instead. This method has a
+     * flawed behavior of transparently falling back to a remote region if no instances for an app is available locally.
+     * The new behavior is to explicitly specify if you need a remote region.
+     */
+    @Deprecated
+    public Applications getApplicationDeltas() {
+        GET_ALL_CACHE_MISS_DELTA.increment();
+        Applications apps = new Applications();
+        apps.setVersion(responseCache.getVersionDelta().get());
+        Map<String, Application> applicationInstancesMap = new HashMap<String, Application>();
+        write.lock();
+        try {
+            Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
+            logger.debug("The number of elements in the delta queue is : {}",
+                    this.recentlyChangedQueue.size());
+            while (iter.hasNext()) {
+                Lease<InstanceInfo> lease = iter.next().getLeaseInfo();
+                InstanceInfo instanceInfo = lease.getHolder();
+                logger.debug(
+                        "The instance id {} is found with status {} and actiontype {}",
+                        instanceInfo.getId(), instanceInfo.getStatus().name(), instanceInfo.getActionType().name());
+                Application app = applicationInstancesMap.get(instanceInfo
+                        .getAppName());
+                if (app == null) {
+                    app = new Application(instanceInfo.getAppName());
+                    applicationInstancesMap.put(instanceInfo.getAppName(), app);
+                    apps.addApplication(app);
+                }
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
+            }
+
+            boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
+
+            if (!disableTransparentFallback) {
+                Applications allAppsInLocalRegion = getApplications(false);
+
+                for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                    Applications applications = remoteRegistry.getApplicationDeltas();
+                    for (Application application : applications.getRegisteredApplications()) {
+                        Application appInLocalRegistry =
+                                allAppsInLocalRegion.getRegisteredApplications(application.getName());
+                        if (appInLocalRegistry == null) {
+                            apps.addApplication(application);
+                        }
+                    }
+                }
+            }
+
+            Applications allApps = getApplications(!disableTransparentFallback);
+            apps.setAppsHashCode(allApps.getReconcileHashCode());
+            return apps;
+        } finally {
+            write.unlock();
+        }
+    }
+
+    /**
+     * Gets the application delta also including instances from the passed remote regions, with the instances from the
+     * local region. <br/>
+     *
+     * The remote regions from where the instances will be chosen can further be restricted if this application does not
+     * appear in the whitelist specified for the region as returned by
+     * {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} for a region. In case, there is no whitelist
+     * defined for a region, this method will also look for a global whitelist by passing <code>null</code> to the
+     * method {@link EurekaServerConfig#getRemoteRegionAppWhitelist(String)} <br/>
+     *
+     * @param remoteRegions The remote regions for which the instances are to be queried. The instances may be limited
+     *                      by a whitelist as explained above. If <code>null</code> all remote regions are included.
+     *                      If empty list then no remote region is included.
+     *
+     * @return The delta with instances from the passed remote regions as well as local region. The instances
+     * from remote regions can be further be restricted as explained above. <code>null</code> if the application does
+     * not exist locally or in remote regions.
+     */
+    public Applications getApplicationDeltasFromMultipleRegions(String[] remoteRegions) {
+        if (null == remoteRegions) {
+            remoteRegions = allKnownRemoteRegions; // null means all remote regions.
+        }
+
+        boolean includeRemoteRegion = remoteRegions.length != 0;
+
+        if (includeRemoteRegion) {
+            GET_ALL_WITH_REMOTE_REGIONS_CACHE_MISS_DELTA.increment();
+        } else {
+            GET_ALL_CACHE_MISS_DELTA.increment();
+        }
+
+        Applications apps = new Applications();
+        apps.setVersion(responseCache.getVersionDeltaWithRegions().get());
+        Map<String, Application> applicationInstancesMap = new HashMap<String, Application>();
+        write.lock();
+        try {
+            Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
+            logger.debug("The number of elements in the delta queue is :{}", this.recentlyChangedQueue.size());
+            while (iter.hasNext()) {
+                Lease<InstanceInfo> lease = iter.next().getLeaseInfo();
+                InstanceInfo instanceInfo = lease.getHolder();
+                logger.debug("The instance id {} is found with status {} and actiontype {}",
+                        instanceInfo.getId(), instanceInfo.getStatus().name(), instanceInfo.getActionType().name());
+                Application app = applicationInstancesMap.get(instanceInfo.getAppName());
+                if (app == null) {
+                    app = new Application(instanceInfo.getAppName());
+                    applicationInstancesMap.put(instanceInfo.getAppName(), app);
+                    apps.addApplication(app);
+                }
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
+            }
+
+            if (includeRemoteRegion) {
+                for (String remoteRegion : remoteRegions) {
+                    RemoteRegionRegistry remoteRegistry = regionNameVSRemoteRegistry.get(remoteRegion);
+                    if (null != remoteRegistry) {
+                        Applications remoteAppsDelta = remoteRegistry.getApplicationDeltas();
+                        if (null != remoteAppsDelta) {
+                            for (Application application : remoteAppsDelta.getRegisteredApplications()) {
+                                if (shouldFetchFromRemoteRegistry(application.getName(), remoteRegion)) {
+                                    Application appInstanceTillNow =
+                                            apps.getRegisteredApplications(application.getName());
+                                    if (appInstanceTillNow == null) {
+                                        appInstanceTillNow = new Application(application.getName());
+                                        apps.addApplication(appInstanceTillNow);
+                                    }
+                                    for (InstanceInfo instanceInfo : application.getInstances()) {
+                                        appInstanceTillNow.addInstance(new InstanceInfo(instanceInfo));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Applications allApps = getApplicationsFromMultipleRegions(remoteRegions);
+            apps.setAppsHashCode(allApps.getReconcileHashCode());
+            return apps;
+        } finally {
+            write.unlock();
+        }
+    }
+
+    /**
+     * Gets the {@link InstanceInfo} information.
+     *
+     * @param appName the application name for which the information is requested.
+     * @param id the unique identifier of the instance.
+     * @return the information about the instance.
+     */
+    @Override
+    public InstanceInfo getInstanceByAppAndId(String appName, String id) {
+        return this.getInstanceByAppAndId(appName, id, true);
+    }
+
+    /**
+     * Gets the {@link InstanceInfo} information.
+     *
+     * @param appName the application name for which the information is requested.
+     * @param id the unique identifier of the instance.
+     * @param includeRemoteRegions true, if we need to include applications from remote regions
+     *                             as indicated by the region {@link URL} by this property
+     *                             {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return the information about the instance.
+     */
+    @Override
+    public InstanceInfo getInstanceByAppAndId(String appName, String id, boolean includeRemoteRegions) {
+        Map<String, Lease<InstanceInfo>> leaseMap = registry.get(appName);
+        Lease<InstanceInfo> lease = null;
+        if (leaseMap != null) {
+            lease = leaseMap.get(id);
+        }
+        if (lease != null
+                && (!isLeaseExpirationEnabled() || !lease.isExpired())) {
+            return decorateInstanceInfo(lease);
+        } else if (includeRemoteRegions) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                Application application = remoteRegistry.getApplication(appName);
+                if (application != null) {
+                    return application.getByInstanceId(id);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @deprecated Try {@link #getInstanceByAppAndId(String, String)} instead.
+     *
+     * Get all instances by ID, including automatically asking other regions if the ID is unknown.
+     *
+     * @see com.netflix.discovery.shared.LookupService#getInstancesById(String)
+     */
+    @Deprecated
+    public List<InstanceInfo> getInstancesById(String id) {
+        return this.getInstancesById(id, true);
+    }
+
+    /**
+     * @deprecated Try {@link #getInstanceByAppAndId(String, String, boolean)} instead.
+     *
+     * Get the list of instances by its unique id.
+     *
+     * @param id the unique id of the instance
+     * @param includeRemoteRegions true, if we need to include applications from remote regions
+     *                             as indicated by the region {@link URL} by this property
+     *                             {@link EurekaServerConfig#getRemoteRegionUrls()}, false otherwise
+     * @return list of InstanceInfo objects.
+     */
+    @Deprecated
+    public List<InstanceInfo> getInstancesById(String id, boolean includeRemoteRegions) {
+        List<InstanceInfo> list = new ArrayList<InstanceInfo>();
+
+        for (Iterator<Entry<String, Map<String, Lease<InstanceInfo>>>> iter =
+                     registry.entrySet().iterator(); iter.hasNext(); ) {
+
+            Map<String, Lease<InstanceInfo>> leaseMap = iter.next().getValue();
+            if (leaseMap != null) {
+                Lease<InstanceInfo> lease = leaseMap.get(id);
+
+                if (lease == null || (isLeaseExpirationEnabled() && lease.isExpired())) {
                     continue;
                 }
-                String[] instanceVipAddresses = instanceVipAddress
-                        .split(COMMA_STRING);
 
-                // If the VIP Address is delimited by a comma, then consider to
-                // be a list of VIP Addresses.
-                // Try to match at least one in the list, if it matches then
-                // return the instance info for the same
-                for (String vipAddressFromList : instanceVipAddresses) {
-                    if (vipAddress.equalsIgnoreCase(vipAddressFromList.trim())
-                            && appName.equalsIgnoreCase(instance.getAppName())) {
-                        result.add(instance);
+                if (list == Collections.EMPTY_LIST) {
+                    list = new ArrayList<InstanceInfo>();
+                }
+                list.add(decorateInstanceInfo(lease));
+            }
+        }
+        if (list.isEmpty() && includeRemoteRegions) {
+            for (RemoteRegionRegistry remoteRegistry : this.regionNameVSRemoteRegistry.values()) {
+                for (Application application : remoteRegistry.getApplications()
+                        .getRegisteredApplications()) {
+                    InstanceInfo instanceInfo = application.getByInstanceId(id);
+                    if (instanceInfo != null) {
+                        list.add(instanceInfo);
+                        return list;
+                    }
+                }
+            }
+        }
+        return list;
+    }
+
+    private InstanceInfo decorateInstanceInfo(Lease<InstanceInfo> lease) {
+        InstanceInfo info = lease.getHolder();
+
+        // client app settings
+        int renewalInterval = LeaseInfo.DEFAULT_LEASE_RENEWAL_INTERVAL;
+        int leaseDuration = LeaseInfo.DEFAULT_LEASE_DURATION;
+
+        // TODO: clean this up
+        if (info.getLeaseInfo() != null) {
+            renewalInterval = info.getLeaseInfo().getRenewalIntervalInSecs();
+            leaseDuration = info.getLeaseInfo().getDurationInSecs();
+        }
+
+        info.setLeaseInfo(LeaseInfo.Builder.newBuilder()
+                .setRegistrationTimestamp(lease.getRegistrationTimestamp())
+                .setRenewalTimestamp(lease.getLastRenewalTimestamp())
+                .setServiceUpTimestamp(lease.getServiceUpTimestamp())
+                .setRenewalIntervalInSecs(renewalInterval)
+                .setDurationInSecs(leaseDuration)
+                .setEvictionTimestamp(lease.getEvictionTimestamp()).build());
+
+        info.setIsCoordinatingDiscoveryServer();
+        return info;
+    }
+
+    /**
+     * Servo route; do not call.
+     *
+     * @return servo data
+     */
+    @com.netflix.servo.annotations.Monitor(name = "numOfRenewsInLastMin",
+            description = "Number of total heartbeats received in the last minute", type = DataSourceType.GAUGE)
+    @Override
+    public long getNumOfRenewsInLastMin() {
+        return renewsLastMin.getCount();
+    }
+
+
+    /**
+     * Gets the threshold for the renewals per minute.
+     *
+     * @return the integer representing the threshold for the renewals per
+     *         minute.
+     */
+    @com.netflix.servo.annotations.Monitor(name = "numOfRenewsPerMinThreshold", type = DataSourceType.GAUGE)
+    @Override
+    public int getNumOfRenewsPerMinThreshold() {
+        return numberOfRenewsPerMinThreshold;
+    }
+
+    /**
+     * Get the N instances that are most recently registered.
+     *
+     * @return
+     */
+    @Override
+    public List<Pair<Long, String>> getLastNRegisteredInstances() {
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentRegisteredQueue);
+        Collections.reverse(list);
+        return list;
+    }
+
+    /**
+     * Get the N instances that have most recently canceled.
+     *
+     * @return
+     */
+    @Override
+    public List<Pair<Long, String>> getLastNCanceledInstances() {
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentCanceledQueue);
+        Collections.reverse(list);
+        return list;
+    }
+
+    private void invalidateCache(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
+        // invalidate cache
+        responseCache.invalidate(appName, vipAddress, secureVipAddress);
+    }
+
+    protected void updateRenewsPerMinThreshold() {
+        this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
+                * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
+                * serverConfig.getRenewalPercentThreshold());
+    }
+
+    private static final class RecentlyChangedItem {
+        private long lastUpdateTime;
+        private Lease<InstanceInfo> leaseInfo;
+
+        public RecentlyChangedItem(Lease<InstanceInfo> lease) {
+            this.leaseInfo = lease;
+            lastUpdateTime = System.currentTimeMillis();
+        }
+
+        public long getLastUpdateTime() {
+            return this.lastUpdateTime;
+        }
+
+        public Lease<InstanceInfo> getLeaseInfo() {
+            return this.leaseInfo;
+        }
+    }
+
+    protected void postInit() {
+        renewsLastMin.start();
+        if (evictionTaskRef.get() != null) {
+            evictionTaskRef.get().cancel();
+        }
+        evictionTaskRef.set(new EvictionTask());
+        evictionTimer.schedule(evictionTaskRef.get(),
+                serverConfig.getEvictionIntervalTimerInMs(),
+                serverConfig.getEvictionIntervalTimerInMs());
+    }
+
+    /**
+     * Perform all cleanup and shutdown operations.
+     */
+    @Override
+    public void shutdown() {
+        deltaRetentionTimer.cancel();
+        evictionTimer.cancel();
+        renewsLastMin.stop();
+        responseCache.stop();
+    }
+
+    @com.netflix.servo.annotations.Monitor(name = "numOfElementsinInstanceCache", description = "Number of overrides in the instance Cache", type = DataSourceType.GAUGE)
+    public long getNumberofElementsininstanceCache() {
+        return overriddenInstanceStatusMap.size();
+    }
+
+    /* visible for testing */ class EvictionTask extends TimerTask {
+
+        private final AtomicLong lastExecutionNanosRef = new AtomicLong(0l);
+
+        @Override
+        public void run() {
+            try {
+                long compensationTimeMs = getCompensationTimeMs();
+                logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
+                evict(compensationTimeMs);
+            } catch (Throwable e) {
+                logger.error("Could not run the evict task", e);
+            }
+        }
+
+        /**
+         * compute a compensation time defined as the actual time this task was executed since the prev iteration,
+         * vs the configured amount of time for execution. This is useful for cases where changes in time (due to
+         * clock skew or gc for example) causes the actual eviction task to execute later than the desired time
+         * according to the configured cycle.
+         */
+        long getCompensationTimeMs() {
+            long currNanos = getCurrentTimeNano();
+            long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
+            if (lastNanos == 0l) {
+                return 0l;
+            }
+
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);
+            long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();
+            return compensationTime <= 0l ? 0l : compensationTime;
+        }
+
+        long getCurrentTimeNano() {  // for testing
+            return System.nanoTime();
+        }
+
+    }
+
+    /* visible for testing */ static class CircularQueue<E> extends AbstractQueue<E> {
+
+        private final ArrayBlockingQueue<E> delegate;
+        private final int capacity;
+
+        public CircularQueue(int capacity) {
+            this.capacity = capacity;
+            this.delegate = new ArrayBlockingQueue<>(capacity);
+        }
+
+        @Override
+        public Iterator<E> iterator() {
+            return delegate.iterator();
+        }
+
+        @Override
+        public int size() {
+            return delegate.size();
+        }
+
+        @Override
+        public boolean offer(E e) {
+            while (!delegate.offer(e)) {
+                delegate.poll();
+            }
+            return true;
+        }
+
+        @Override
+        public E poll() {
+            return delegate.poll();
+        }
+
+        @Override
+        public E peek() {
+            return delegate.peek();
+        }
+
+        @Override
+        public void clear() {
+            delegate.clear();
+        }
+
+        @Override
+        public Object[] toArray() {
+            return delegate.toArray();
+        }
+    }
+
+    /**
+     * @return The rule that will process the instance status override.
+     */
+    protected abstract InstanceStatusOverrideRule getInstanceInfoOverrideRule();
+
+    protected InstanceInfo.InstanceStatus getOverriddenInstanceStatus(InstanceInfo r,
+                                                                    Lease<InstanceInfo> existingLease,
+                                                                    boolean isReplication) {
+        InstanceStatusOverrideRule rule = getInstanceInfoOverrideRule();
+        logger.debug("Processing override status using rule: {}", rule);
+        return rule.apply(r, existingLease, isReplication).status();
+    }
+
+    private TimerTask getDeltaRetentionTask() {
+        return new TimerTask() {
+
+            @Override
+            public void run() {
+                Iterator<RecentlyChangedItem> it = recentlyChangedQueue.iterator();
+                while (it.hasNext()) {
+                    if (it.next().getLastUpdateTime() <
+                            System.currentTimeMillis() - serverConfig.getRetentionTimeInMSInDeltaQueue()) {
+                        it.remove();
+                    } else {
                         break;
                     }
                 }
             }
-        }
-        return result;
+
+        };
     }
-
-    /*
-     * (non-Javadoc)
-     *
-     * @see
-     * com.netflix.discovery.shared.LookupService#getNextServerFromEureka(java
-     * .lang.String, boolean)
-     */
-    @Override
-    public InstanceInfo getNextServerFromEureka(String virtualHostname, boolean secure) {
-        List<InstanceInfo> instanceInfoList = this.getInstancesByVipAddress(
-                virtualHostname, secure);
-        if (instanceInfoList == null || instanceInfoList.isEmpty()) {
-            throw new RuntimeException("No matches for the virtual host name :"
-                    + virtualHostname);
-        }
-        Applications apps = this.localRegionApps.get();
-        int index = (int) (apps.getNextIndex(virtualHostname,
-                secure).incrementAndGet() % instanceInfoList.size());
-        return instanceInfoList.get(index);
-    }
-
-    /**
-     * Get all applications registered with a specific eureka service.
-     *
-     * @param serviceUrl
-     *            - The string representation of the service url.
-     * @return - The registry information containing all applications.
-     */
-    @Override
-    public Applications getApplications(String serviceUrl) {
-        try {
-            EurekaHttpResponse<Applications> response = clientConfig.getRegistryRefreshSingleVipAddress() == null
-                    ? eurekaTransport.queryClient.getApplications()
-                    : eurekaTransport.queryClient.getVip(clientConfig.getRegistryRefreshSingleVipAddress());
-            if (response.getStatusCode() == Status.OK.getStatusCode()) {
-                logger.debug(PREFIX + "{} -  refresh status: {}", appPathIdentifier, response.getStatusCode());
-                return response.getEntity();
-            }
-            logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {}",
-                    appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), response.getStatusCode());
-        } catch (Throwable th) {
-            logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {} stacktrace = {}",
-                    appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), th.getMessage(), ExceptionUtils.getStackTrace(th));
-        }
-        return null;
-    }
-
-    /**
-     * Register with the eureka service by making the appropriate REST call.
-     */
-    boolean register() throws Throwable {
-        logger.info(PREFIX + "{}: registering service...", appPathIdentifier);
-        EurekaHttpResponse<Void> httpResponse;
-        try {
-            httpResponse = eurekaTransport.registrationClient.register(instanceInfo);
-        } catch (Exception e) {
-            logger.warn(PREFIX + "{} - registration failed {}", appPathIdentifier, e.getMessage(), e);
-            throw e;
-        }
-        if (logger.isInfoEnabled()) {
-            logger.info(PREFIX + "{} - registration status: {}", appPathIdentifier, httpResponse.getStatusCode());
-        }
-        return httpResponse.getStatusCode() == Status.NO_CONTENT.getStatusCode();
-    }
-
-    /**
-     * Renew with the eureka service by making the appropriate REST call
-     */
-    boolean renew() {
-        EurekaHttpResponse<InstanceInfo> httpResponse;
-        try {
-            httpResponse = eurekaTransport.registrationClient.sendHeartBeat(instanceInfo.getAppName(), instanceInfo.getId(), instanceInfo, null);
-            logger.debug(PREFIX + "{} - Heartbeat status: {}", appPathIdentifier, httpResponse.getStatusCode());
-            if (httpResponse.getStatusCode() == Status.NOT_FOUND.getStatusCode()) {
-                REREGISTER_COUNTER.increment();
-                logger.info(PREFIX + "{} - Re-registering apps/{}", appPathIdentifier, instanceInfo.getAppName());
-                long timestamp = instanceInfo.setIsDirtyWithTime();
-                boolean success = register();
-                if (success) {
-                    instanceInfo.unsetIsDirty(timestamp);
-                }
-                return success;
-            }
-            return httpResponse.getStatusCode() == Status.OK.getStatusCode();
-        } catch (Throwable e) {
-            logger.error(PREFIX + "{} - was unable to send heartbeat!", appPathIdentifier, e);
-            return false;
-        }
-    }
-
-    /**
-     * @deprecated see replacement in {@link com.netflix.discovery.endpoint.EndpointUtils}
-     *
-     * Get the list of all eureka service urls from properties file for the eureka client to talk to.
-     *
-     * @param instanceZone The zone in which the client resides
-     * @param preferSameZone true if we have to prefer the same zone as the client, false otherwise
-     * @return The list of all eureka service urls for the eureka client to talk to
-     */
-    @Deprecated
-    @Override
-    public List<String> getServiceUrlsFromConfig(String instanceZone, boolean preferSameZone) {
-        return EndpointUtils.getServiceUrlsFromConfig(clientConfig, instanceZone, preferSameZone);
-    }
-
-    /**
-     * Shuts down Eureka Client. Also sends a deregistration request to the
-     * eureka server.
-     */
-    @PreDestroy
-    @Override
-    public synchronized void shutdown() {
-        if (isShutdown.compareAndSet(false, true)) {
-            logger.info("Shutting down DiscoveryClient ...");
-
-            if (statusChangeListener != null && applicationInfoManager != null) {
-                applicationInfoManager.unregisterStatusChangeListener(statusChangeListener.getId());
-            }
-
-            cancelScheduledTasks();
-
-            // If APPINFO was registered
-            if (applicationInfoManager != null
-                    && clientConfig.shouldRegisterWithEureka()
-                    && clientConfig.shouldUnregisterOnShutdown()) {
-                applicationInfoManager.setInstanceStatus(InstanceStatus.DOWN);
-                unregister();
-            }
-
-            if (eurekaTransport != null) {
-                eurekaTransport.shutdown();
-            }
-
-            heartbeatStalenessMonitor.shutdown();
-            registryStalenessMonitor.shutdown();
-
-            Monitors.unregisterObject(this);
-
-            logger.info("Completed shut down of DiscoveryClient");
-        }
-    }
-
-    /**
-     * unregister w/ the eureka service.
-     */
-    void unregister() {
-        // It can be null if shouldRegisterWithEureka == false
-        if(eurekaTransport != null && eurekaTransport.registrationClient != null) {
-            try {
-                logger.info("Unregistering ...");
-                EurekaHttpResponse<Void> httpResponse = eurekaTransport.registrationClient.cancel(instanceInfo.getAppName(), instanceInfo.getId());
-                logger.info(PREFIX + "{} - deregister  status: {}", appPathIdentifier, httpResponse.getStatusCode());
-            } catch (Exception e) {
-                logger.error(PREFIX + "{} - de-registration failed{}", appPathIdentifier, e.getMessage(), e);
-            }
-        }
-    }
-
-    /**
-     * Fetches the registry information.
-     *
-     * <p>
-     * This method tries to get only deltas after the first fetch unless there
-     * is an issue in reconciling eureka server and client registry information.
-     * </p>
-     *
-     * @param forceFullRegistryFetch Forces a full registry fetch.
-     *
-     * @return true if the registry was fetched
-     */
-    private boolean fetchRegistry(boolean forceFullRegistryFetch) {
-        Stopwatch tracer = FETCH_REGISTRY_TIMER.start();
-
-        try {
-            // If the delta is disabled or if it is the first time, get all
-            // applications
-            Applications applications = getApplications();
-
-            if (clientConfig.shouldDisableDelta()
-                    || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
-                    || forceFullRegistryFetch
-                    || (applications == null)
-                    || (applications.getRegisteredApplications().size() == 0)
-                    || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta
-            {
-                logger.info("Disable delta property : {}", clientConfig.shouldDisableDelta());
-                logger.info("Single vip registry refresh property : {}", clientConfig.getRegistryRefreshSingleVipAddress());
-                logger.info("Force full registry fetch : {}", forceFullRegistryFetch);
-                logger.info("Application is null : {}", (applications == null));
-                logger.info("Registered Applications size is zero : {}",
-                        (applications.getRegisteredApplications().size() == 0));
-                logger.info("Application version is -1: {}", (applications.getVersion() == -1));
-                getAndStoreFullRegistry();
-            } else {
-                getAndUpdateDelta(applications);
-            }
-            applications.setAppsHashCode(applications.getReconcileHashCode());
-            logTotalInstances();
-        } catch (Throwable e) {
-            logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {} stacktrace = {}",
-                    appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), e.getMessage(), ExceptionUtils.getStackTrace(e));
-            return false;
-        } finally {
-            if (tracer != null) {
-                tracer.stop();
-            }
-        }
-
-        // Notify about cache refresh before updating the instance remote status
-        onCacheRefreshed();
-
-        // Update remote status based on refreshed data held in the cache
-        updateInstanceRemoteStatus();
-
-        // registry was fetched successfully, so return true
-        return true;
-    }
-
-    private synchronized void updateInstanceRemoteStatus() {
-        // Determine this instance's status for this app and set to UNKNOWN if not found
-        InstanceInfo.InstanceStatus currentRemoteInstanceStatus = null;
-        if (instanceInfo.getAppName() != null) {
-            Application app = getApplication(instanceInfo.getAppName());
-            if (app != null) {
-                InstanceInfo remoteInstanceInfo = app.getByInstanceId(instanceInfo.getId());
-                if (remoteInstanceInfo != null) {
-                    currentRemoteInstanceStatus = remoteInstanceInfo.getStatus();
-                }
-            }
-        }
-        if (currentRemoteInstanceStatus == null) {
-            currentRemoteInstanceStatus = InstanceInfo.InstanceStatus.UNKNOWN;
-        }
-
-        // Notify if status changed
-        if (lastRemoteInstanceStatus != currentRemoteInstanceStatus) {
-            onRemoteStatusChanged(lastRemoteInstanceStatus, currentRemoteInstanceStatus);
-            lastRemoteInstanceStatus = currentRemoteInstanceStatus;
-        }
-    }
-
-    /**
-     * @return Return he current instance status as seen on the Eureka server.
-     */
-    @Override
-    public InstanceInfo.InstanceStatus getInstanceRemoteStatus() {
-        return lastRemoteInstanceStatus;
-    }
-
-    private String getReconcileHashCode(Applications applications) {
-        TreeMap<String, AtomicInteger> instanceCountMap = new TreeMap<String, AtomicInteger>();
-        if (isFetchingRemoteRegionRegistries()) {
-            for (Applications remoteApp : remoteRegionVsApps.values()) {
-                remoteApp.populateInstanceCountMap(instanceCountMap);
-            }
-        }
-        applications.populateInstanceCountMap(instanceCountMap);
-        return Applications.getReconcileHashCode(instanceCountMap);
-    }
-
-    /**
-     * Gets the full registry information from the eureka server and stores it locally.
-     * When applying the full registry, the following flow is observed:
-     *
-     * if (update generation have not advanced (due to another thread))
-     *   atomically set the registry to the new registry
-     * fi
-     *
-     * @return the full registry information.
-     * @throws Throwable
-     *             on error.
-     */
-    private void getAndStoreFullRegistry() throws Throwable {
-        long currentUpdateGeneration = fetchRegistryGeneration.get();
-
-        logger.info("Getting all instance registry info from the eureka server");
-
-        Applications apps = null;
-        EurekaHttpResponse<Applications> httpResponse = clientConfig.getRegistryRefreshSingleVipAddress() == null
-                ? eurekaTransport.queryClient.getApplications(remoteRegionsRef.get())
-                : eurekaTransport.queryClient.getVip(clientConfig.getRegistryRefreshSingleVipAddress(), remoteRegionsRef.get());
-        if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
-            apps = httpResponse.getEntity();
-        }
-        logger.info("The response status is {}", httpResponse.getStatusCode());
-
-        if (apps == null) {
-            logger.error("The application is null for some reason. Not storing this information");
-        } else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
-            localRegionApps.set(this.filterAndShuffle(apps));
-            logger.debug("Got full registry with apps hashcode {}", apps.getAppsHashCode());
-        } else {
-            logger.warn("Not updating applications as another thread is updating it already");
-        }
-    }
-
-    /**
-     * Get the delta registry information from the eureka server and update it locally.
-     * When applying the delta, the following flow is observed:
-     *
-     * if (update generation have not advanced (due to another thread))
-     *   atomically try to: update application with the delta and get reconcileHashCode
-     *   abort entire processing otherwise
-     *   do reconciliation if reconcileHashCode clash
-     * fi
-     *
-     * @return the client response
-     * @throws Throwable on error
-     */
-    private void getAndUpdateDelta(Applications applications) throws Throwable {
-        long currentUpdateGeneration = fetchRegistryGeneration.get();
-
-        Applications delta = null;
-        EurekaHttpResponse<Applications> httpResponse = eurekaTransport.queryClient.getDelta(remoteRegionsRef.get());
-        if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
-            delta = httpResponse.getEntity();
-        }
-
-        if (delta == null) {
-            logger.warn("The server does not allow the delta revision to be applied because it is not safe. "
-                    + "Hence got the full registry.");
-            getAndStoreFullRegistry();
-        } else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
-            logger.debug("Got delta update with apps hashcode {}", delta.getAppsHashCode());
-            String reconcileHashCode = "";
-            if (fetchRegistryUpdateLock.tryLock()) {
-                try {
-                    updateDelta(delta);
-                    reconcileHashCode = getReconcileHashCode(applications);
-                } finally {
-                    fetchRegistryUpdateLock.unlock();
-                }
-            } else {
-                logger.warn("Cannot acquire update lock, aborting getAndUpdateDelta");
-            }
-            // There is a diff in number of instances for some reason
-            if (!reconcileHashCode.equals(delta.getAppsHashCode()) || clientConfig.shouldLogDeltaDiff()) {
-                reconcileAndLogDifference(delta, reconcileHashCode);  // this makes a remoteCall
-            }
-        } else {
-            logger.warn("Not updating application delta as another thread is updating it already");
-            logger.debug("Ignoring delta update with apps hashcode {}, as another thread is updating it already", delta.getAppsHashCode());
-        }
-    }
-
-    /**
-     * Logs the total number of non-filtered instances stored locally.
-     */
-    private void logTotalInstances() {
-        if (logger.isDebugEnabled()) {
-            int totInstances = 0;
-            for (Application application : getApplications().getRegisteredApplications()) {
-                totInstances += application.getInstancesAsIsFromEureka().size();
-            }
-            logger.debug("The total number of all instances in the client now is {}", totInstances);
-        }
-    }
-
-    /**
-     * Reconcile the eureka server and client registry information and logs the differences if any.
-     * When reconciling, the following flow is observed:
-     *
-     * make a remote call to the server for the full registry
-     * calculate and log differences
-     * if (update generation have not advanced (due to another thread))
-     *   atomically set the registry to the new registry
-     * fi
-     *
-     * @param delta
-     *            the last delta registry information received from the eureka
-     *            server.
-     * @param reconcileHashCode
-     *            the hashcode generated by the server for reconciliation.
-     * @return ClientResponse the HTTP response object.
-     * @throws Throwable
-     *             on any error.
-     */
-    private void reconcileAndLogDifference(Applications delta, String reconcileHashCode) throws Throwable {
-        logger.debug("The Reconcile hashcodes do not match, client : {}, server : {}. Getting the full registry",
-                reconcileHashCode, delta.getAppsHashCode());
-
-        RECONCILE_HASH_CODES_MISMATCH.increment();
-
-        long currentUpdateGeneration = fetchRegistryGeneration.get();
-
-        EurekaHttpResponse<Applications> httpResponse = clientConfig.getRegistryRefreshSingleVipAddress() == null
-                ? eurekaTransport.queryClient.getApplications(remoteRegionsRef.get())
-                : eurekaTransport.queryClient.getVip(clientConfig.getRegistryRefreshSingleVipAddress(), remoteRegionsRef.get());
-        Applications serverApps = httpResponse.getEntity();
-
-        if (serverApps == null) {
-            logger.warn("Cannot fetch full registry from the server; reconciliation failure");
-            return;
-        }
-
-        if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
-            localRegionApps.set(this.filterAndShuffle(serverApps));
-            getApplications().setVersion(delta.getVersion());
-            logger.debug(
-                    "The Reconcile hashcodes after complete sync up, client : {}, server : {}.",
-                    getApplications().getReconcileHashCode(),
-                    delta.getAppsHashCode());
-        } else {
-            logger.warn("Not setting the applications map as another thread has advanced the update generation");
-        }
-    }
-
-    /**
-     * Updates the delta information fetches from the eureka server into the
-     * local cache.
-     *
-     * @param delta
-     *            the delta information received from eureka server in the last
-     *            poll cycle.
-     */
-    private void updateDelta(Applications delta) {
-        int deltaCount = 0;
-        for (Application app : delta.getRegisteredApplications()) {
-            for (InstanceInfo instance : app.getInstances()) {
-                Applications applications = getApplications();
-                String instanceRegion = instanceRegionChecker.getInstanceRegion(instance);
-                if (!instanceRegionChecker.isLocalRegion(instanceRegion)) {
-                    Applications remoteApps = remoteRegionVsApps.get(instanceRegion);
-                    if (null == remoteApps) {
-                        remoteApps = new Applications();
-                        remoteRegionVsApps.put(instanceRegion, remoteApps);
-                    }
-                    applications = remoteApps;
-                }
-
-                ++deltaCount;
-                if (ActionType.ADDED.equals(instance.getActionType())) {
-                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
-                    if (existingApp == null) {
-                        applications.addApplication(app);
-                    }
-                    logger.debug("Added instance {} to the existing apps in region {}", instance.getId(), instanceRegion);
-                    applications.getRegisteredApplications(instance.getAppName()).addInstance(instance);
-                } else if (ActionType.MODIFIED.equals(instance.getActionType())) {
-                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
-                    if (existingApp == null) {
-                        applications.addApplication(app);
-                    }
-                    logger.debug("Modified instance {} to the existing apps ", instance.getId());
-
-                    applications.getRegisteredApplications(instance.getAppName()).addInstance(instance);
-
-                } else if (ActionType.DELETED.equals(instance.getActionType())) {
-                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
-                    if (existingApp != null) {
-                        logger.debug("Deleted instance {} to the existing apps ", instance.getId());
-                        existingApp.removeInstance(instance);
-                        /*
-                         * We find all instance list from application(The status of instance status is not only the status is UP but also other status)
-                         * if instance list is empty, we remove the application.
-                         */
-                        if (existingApp.getInstancesAsIsFromEureka().isEmpty()) {
-                            applications.removeApplication(existingApp);
-                        }
-                    }
-                }
-            }
-        }
-        logger.debug("The total number of instances fetched by the delta processor : {}", deltaCount);
-
-        getApplications().setVersion(delta.getVersion());
-        getApplications().shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
-
-        for (Applications applications : remoteRegionVsApps.values()) {
-            applications.setVersion(delta.getVersion());
-            applications.shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
-        }
-    }
-
-    /**
-     * Initializes all scheduled tasks.
-     */
-    private void initScheduledTasks() {
-        if (clientConfig.shouldFetchRegistry()) {
-            // registry cache refresh timer
-            int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
-            int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
-            cacheRefreshTask = new TimedSupervisorTask(
-                    "cacheRefresh",
-                    scheduler,
-                    cacheRefreshExecutor,
-                    registryFetchIntervalSeconds,
-                    TimeUnit.SECONDS,
-                    expBackOffBound,
-                    new CacheRefreshThread()
-            );
-            scheduler.schedule(
-                    cacheRefreshTask,
-                    registryFetchIntervalSeconds, TimeUnit.SECONDS);
-        }
-
-        if (clientConfig.shouldRegisterWithEureka()) {
-            int renewalIntervalInSecs = instanceInfo.getLeaseInfo().getRenewalIntervalInSecs();
-            int expBackOffBound = clientConfig.getHeartbeatExecutorExponentialBackOffBound();
-            logger.info("Starting heartbeat executor: " + "renew interval is: {}", renewalIntervalInSecs);
-
-            // Heartbeat timer
-            heartbeatTask = new TimedSupervisorTask(
-                    "heartbeat",
-                    scheduler,
-                    heartbeatExecutor,
-                    renewalIntervalInSecs,
-                    TimeUnit.SECONDS,
-                    expBackOffBound,
-                    new HeartbeatThread()
-            );
-            scheduler.schedule(
-                    heartbeatTask,
-                    renewalIntervalInSecs, TimeUnit.SECONDS);
-
-            // InstanceInfo replicator
-            instanceInfoReplicator = new InstanceInfoReplicator(
-                    this,
-                    instanceInfo,
-                    clientConfig.getInstanceInfoReplicationIntervalSeconds(),
-                    2); // burstSize
-
-            statusChangeListener = new ApplicationInfoManager.StatusChangeListener() {
-                @Override
-                public String getId() {
-                    return "statusChangeListener";
-                }
-
-                @Override
-                public void notify(StatusChangeEvent statusChangeEvent) {
-                    logger.info("Saw local status change event {}", statusChangeEvent);
-                    instanceInfoReplicator.onDemandUpdate();
-                }
-            };
-
-            if (clientConfig.shouldOnDemandUpdateStatusChange()) {
-                applicationInfoManager.registerStatusChangeListener(statusChangeListener);
-            }
-
-            instanceInfoReplicator.start(clientConfig.getInitialInstanceInfoReplicationIntervalSeconds());
-        } else {
-            logger.info("Not registering with Eureka server per configuration");
-        }
-    }
-
-    private void cancelScheduledTasks() {
-        if (instanceInfoReplicator != null) {
-            instanceInfoReplicator.stop();
-        }
-        if (heartbeatExecutor != null) {
-            heartbeatExecutor.shutdownNow();
-        }
-        if (cacheRefreshExecutor != null) {
-            cacheRefreshExecutor.shutdownNow();
-        }
-        if (scheduler != null) {
-            scheduler.shutdownNow();
-        }
-        if (cacheRefreshTask != null) {
-            cacheRefreshTask.cancel();
-        }
-        if (heartbeatTask != null) {
-            heartbeatTask.cancel();
-        }
-    }
-
-    /**
-     * @deprecated see replacement in {@link com.netflix.discovery.endpoint.EndpointUtils}
-     *
-     * Get the list of all eureka service urls from DNS for the eureka client to
-     * talk to. The client picks up the service url from its zone and then fails over to
-     * other zones randomly. If there are multiple servers in the same zone, the client once
-     * again picks one randomly. This way the traffic will be distributed in the case of failures.
-     *
-     * @param instanceZone The zone in which the client resides.
-     * @param preferSameZone true if we have to prefer the same zone as the client, false otherwise.
-     * @return The list of all eureka service urls for the eureka client to talk to.
-     */
-    @Deprecated
-    @Override
-    public List<String> getServiceUrlsFromDNS(String instanceZone, boolean preferSameZone) {
-        return EndpointUtils.getServiceUrlsFromDNS(clientConfig, instanceZone, preferSameZone, urlRandomizer);
-    }
-
-    /**
-     * @deprecated see replacement in {@link com.netflix.discovery.endpoint.EndpointUtils}
-     */
-    @Deprecated
-    @Override
-    public List<String> getDiscoveryServiceUrls(String zone) {
-        return EndpointUtils.getDiscoveryServiceUrls(clientConfig, zone, urlRandomizer);
-    }
-
-    /**
-     * @deprecated see replacement in {@link com.netflix.discovery.endpoint.EndpointUtils}
-     *
-     * Get the list of EC2 URLs given the zone name.
-     *
-     * @param dnsName The dns name of the zone-specific CNAME
-     * @param type CNAME or EIP that needs to be retrieved
-     * @return The list of EC2 URLs associated with the dns name
-     */
-    @Deprecated
-    public static Set<String> getEC2DiscoveryUrlsFromZone(String dnsName,
-                                                          EndpointUtils.DiscoveryUrlType type) {
-        return EndpointUtils.getEC2DiscoveryUrlsFromZone(dnsName, type);
-    }
-
-    /**
-     * Refresh the current local instanceInfo. Note that after a valid refresh where changes are observed, the
-     * isDirty flag on the instanceInfo is set to true
-     */
-    void refreshInstanceInfo() {
-        applicationInfoManager.refreshDataCenterInfoIfRequired();
-        applicationInfoManager.refreshLeaseInfoIfRequired();
-
-        InstanceStatus status;
-        try {
-            status = getHealthCheckHandler().getStatus(instanceInfo.getStatus());
-        } catch (Exception e) {
-            logger.warn("Exception from healthcheckHandler.getStatus, setting status to DOWN", e);
-            status = InstanceStatus.DOWN;
-        }
-
-        if (null != status) {
-            applicationInfoManager.setInstanceStatus(status);
-        }
-    }
-
-    /**
-     * The heartbeat task that renews the lease in the given intervals.
-     */
-    private class HeartbeatThread implements Runnable {
-
-        public void run() {
-            if (renew()) {
-                lastSuccessfulHeartbeatTimestamp = System.currentTimeMillis();
-            }
-        }
-    }
-
-    @VisibleForTesting
-    InstanceInfoReplicator getInstanceInfoReplicator() {
-        return instanceInfoReplicator;
-    }
-
-    @VisibleForTesting
-    InstanceInfo getInstanceInfo() {
-        return instanceInfo;
-    }
-
-    @Override
-    public HealthCheckHandler getHealthCheckHandler() {
-        HealthCheckHandler healthCheckHandler = this.healthCheckHandlerRef.get();
-        if (healthCheckHandler == null) {
-            if (null != healthCheckHandlerProvider) {
-                healthCheckHandler = healthCheckHandlerProvider.get();
-            } else if (null != healthCheckCallbackProvider) {
-                healthCheckHandler = new HealthCheckCallbackToHandlerBridge(healthCheckCallbackProvider.get());
-            }
-
-            if (null == healthCheckHandler) {
-                healthCheckHandler = new HealthCheckCallbackToHandlerBridge(null);
-            }
-            this.healthCheckHandlerRef.compareAndSet(null, healthCheckHandler);
-        }
-
-        return this.healthCheckHandlerRef.get();
-    }
-
-    /**
-     * The task that fetches the registry information at specified intervals.
-     *
-     */
-    class CacheRefreshThread implements Runnable {
-        public void run() {
-            refreshRegistry();
-        }
-    }
-
-    @VisibleForTesting
-    void refreshRegistry() {
-        try {
-            boolean isFetchingRemoteRegionRegistries = isFetchingRemoteRegionRegistries();
-
-            boolean remoteRegionsModified = false;
-            // This makes sure that a dynamic change to remote regions to fetch is honored.
-            String latestRemoteRegions = clientConfig.fetchRegistryForRemoteRegions();
-            if (null != latestRemoteRegions) {
-                String currentRemoteRegions = remoteRegionsToFetch.get();
-                if (!latestRemoteRegions.equals(currentRemoteRegions)) {
-                    // Both remoteRegionsToFetch and AzToRegionMapper.regionsToFetch need to be in sync
-                    synchronized (instanceRegionChecker.getAzToRegionMapper()) {
-                        if (remoteRegionsToFetch.compareAndSet(currentRemoteRegions, latestRemoteRegions)) {
-                            String[] remoteRegions = latestRemoteRegions.split(",");
-                            remoteRegionsRef.set(remoteRegions);
-                            instanceRegionChecker.getAzToRegionMapper().setRegionsToFetch(remoteRegions);
-                            remoteRegionsModified = true;
-                        } else {
-                            logger.info("Remote regions to fetch modified concurrently," +
-                                    " ignoring change from {} to {}", currentRemoteRegions, latestRemoteRegions);
-                        }
-                    }
-                } else {
-                    // Just refresh mapping to reflect any DNS/Property change
-                    instanceRegionChecker.getAzToRegionMapper().refreshMapping();
-                }
-            }
-
-            boolean success = fetchRegistry(remoteRegionsModified);
-            if (success) {
-                registrySize = localRegionApps.get().size();
-                lastSuccessfulRegistryFetchTimestamp = System.currentTimeMillis();
-            }
-
-            if (logger.isDebugEnabled()) {
-                StringBuilder allAppsHashCodes = new StringBuilder();
-                allAppsHashCodes.append("Local region apps hashcode: ");
-                allAppsHashCodes.append(localRegionApps.get().getAppsHashCode());
-                allAppsHashCodes.append(", is fetching remote regions? ");
-                allAppsHashCodes.append(isFetchingRemoteRegionRegistries);
-                for (Map.Entry<String, Applications> entry : remoteRegionVsApps.entrySet()) {
-                    allAppsHashCodes.append(", Remote region: ");
-                    allAppsHashCodes.append(entry.getKey());
-                    allAppsHashCodes.append(" , apps hashcode: ");
-                    allAppsHashCodes.append(entry.getValue().getAppsHashCode());
-                }
-                logger.debug("Completed cache refresh task for discovery. All Apps hash code is {} ",
-                        allAppsHashCodes);
-            }
-        } catch (Throwable e) {
-            logger.error("Cannot fetch registry from server", e);
-        }
-    }
-
-    /**
-     * Fetch the registry information from back up registry if all eureka server
-     * urls are unreachable.
-     *
-     * @return true if the registry was fetched
-     */
-    private boolean fetchRegistryFromBackup() {
-        try {
-            @SuppressWarnings("deprecation")
-            BackupRegistry backupRegistryInstance = newBackupRegistryInstance();
-            if (null == backupRegistryInstance) { // backward compatibility with the old protected method, in case it is being used.
-                backupRegistryInstance = backupRegistryProvider.get();
-            }
-
-            if (null != backupRegistryInstance) {
-                Applications apps = null;
-                if (isFetchingRemoteRegionRegistries()) {
-                    String remoteRegionsStr = remoteRegionsToFetch.get();
-                    if (null != remoteRegionsStr) {
-                        apps = backupRegistryInstance.fetchRegistry(remoteRegionsStr.split(","));
-                    }
-                } else {
-                    apps = backupRegistryInstance.fetchRegistry();
-                }
-                if (apps != null) {
-                    final Applications applications = this.filterAndShuffle(apps);
-                    applications.setAppsHashCode(applications.getReconcileHashCode());
-                    localRegionApps.set(applications);
-                    logTotalInstances();
-                    logger.info("Fetched registry successfully from the backup");
-                    return true;
-                }
-            } else {
-                logger.warn("No backup registry instance defined & unable to find any discovery servers.");
-            }
-        } catch (Throwable e) {
-            logger.warn("Cannot fetch applications from apps although backup registry was specified", e);
-        }
-        return false;
-    }
-
-    /**
-     * @deprecated Use injection to provide {@link BackupRegistry} implementation.
-     */
-    @Deprecated
-    @Nullable
-    protected BackupRegistry newBackupRegistryInstance()
-            throws ClassNotFoundException, IllegalAccessException, InstantiationException {
-        return null;
-    }
-
-    /**
-     * Gets the <em>applications</em> after filtering the applications for
-     * instances with only UP states and shuffling them.
-     *
-     * <p>
-     * The filtering depends on the option specified by the configuration
-     * {@link EurekaClientConfig#shouldFilterOnlyUpInstances()}. Shuffling helps
-     * in randomizing the applications list there by avoiding the same instances
-     * receiving traffic during start ups.
-     * </p>
-     *
-     * @param apps
-     *            The applications that needs to be filtered and shuffled.
-     * @return The applications after the filter and the shuffle.
-     */
-    private Applications filterAndShuffle(Applications apps) {
-        if (apps != null) {
-            if (isFetchingRemoteRegionRegistries()) {
-                Map<String, Applications> remoteRegionVsApps = new ConcurrentHashMap<String, Applications>();
-                apps.shuffleAndIndexInstances(remoteRegionVsApps, clientConfig, instanceRegionChecker);
-                for (Applications applications : remoteRegionVsApps.values()) {
-                    applications.shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
-                }
-                this.remoteRegionVsApps = remoteRegionVsApps;
-            } else {
-                apps.shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
-            }
-        }
-        return apps;
-    }
-
-    private boolean isFetchingRemoteRegionRegistries() {
-        return null != remoteRegionsToFetch.get();
-    }
-
-    /**
-     * Invoked when the remote status of this client has changed.
-     * Subclasses may override this method to implement custom behavior if needed.
-     *
-     * @param oldStatus the previous remote {@link InstanceStatus}
-     * @param newStatus the new remote {@link InstanceStatus}
-     */
-    protected void onRemoteStatusChanged(InstanceInfo.InstanceStatus oldStatus, InstanceInfo.InstanceStatus newStatus) {
-        fireEvent(new StatusChangeEvent(oldStatus, newStatus));
-    }
-
-
-    /**
-     * Invoked every time the local registry cache is refreshed (whether changes have
-     * been detected or not).
-     *
-     * Subclasses may override this method to implement custom behavior if needed.
-     */
-    protected void onCacheRefreshed() {
-        fireEvent(new CacheRefreshedEvent());
-    }
-
-    /**
-     * Send the given event on the EventBus if one is available
-     *
-     * @param event the event to send on the eventBus
-     */
-    protected void fireEvent(final EurekaEvent event) {
-        for (EurekaEventListener listener : eventListeners) {
-            try {
-                listener.onEvent(event);
-            } catch (Exception e) {
-                logger.info("Event {} throw an exception for listener {}", event, listener, e.getMessage());
-            }
-        }
-    }
-
-
-    /**
-     * @deprecated see {@link com.netflix.appinfo.InstanceInfo#getZone(String[], com.netflix.appinfo.InstanceInfo)}
-     *
-     * Get the zone that a particular instance is in.
-     *
-     * @param myInfo
-     *            - The InstanceInfo object of the instance.
-     * @return - The zone in which the particular instance belongs to.
-     */
-    @Deprecated
-    public static String getZone(InstanceInfo myInfo) {
-        String[] availZones = staticClientConfig.getAvailabilityZones(staticClientConfig.getRegion());
-        return InstanceInfo.getZone(availZones, myInfo);
-    }
-
-    /**
-     * @deprecated see replacement in {@link com.netflix.discovery.endpoint.EndpointUtils}
-     *
-     * Get the region that this particular instance is in.
-     *
-     * @return - The region in which the particular instance belongs to.
-     */
-    @Deprecated
-    public static String getRegion() {
-        String region = staticClientConfig.getRegion();
-        if (region == null) {
-            region = "default";
-        }
-        region = region.trim().toLowerCase();
-        return region;
-    }
-
-    /**
-     * @deprecated use {@link #getServiceUrlsFromConfig(String, boolean)} instead.
-     */
-    @Deprecated
-    public static List<String> getEurekaServiceUrlsFromConfig(String instanceZone, boolean preferSameZone) {
-        return EndpointUtils.getServiceUrlsFromConfig(staticClientConfig, instanceZone, preferSameZone);
-    }
-
-    public long getLastSuccessfulHeartbeatTimePeriod() {
-        return lastSuccessfulHeartbeatTimestamp < 0
-                ? lastSuccessfulHeartbeatTimestamp
-                : System.currentTimeMillis() - lastSuccessfulHeartbeatTimestamp;
-    }
-
-    public long getLastSuccessfulRegistryFetchTimePeriod() {
-        return lastSuccessfulRegistryFetchTimestamp < 0
-                ? lastSuccessfulRegistryFetchTimestamp
-                : System.currentTimeMillis() - lastSuccessfulRegistryFetchTimestamp;
-    }
-
-    @com.netflix.servo.annotations.Monitor(name = METRIC_REGISTRATION_PREFIX + "lastSuccessfulHeartbeatTimePeriod",
-            description = "How much time has passed from last successful heartbeat", type = DataSourceType.GAUGE)
-    private long getLastSuccessfulHeartbeatTimePeriodInternal() {
-        final long delay = (!clientConfig.shouldRegisterWithEureka() || isShutdown.get())
-            ? 0
-            : getLastSuccessfulHeartbeatTimePeriod();
-
-        heartbeatStalenessMonitor.update(computeStalenessMonitorDelay(delay));
-        return delay;
-    }
-
-    // for metrics only
-    @com.netflix.servo.annotations.Monitor(name = METRIC_REGISTRY_PREFIX + "lastSuccessfulRegistryFetchTimePeriod",
-            description = "How much time has passed from last successful local registry update", type = DataSourceType.GAUGE)
-    private long getLastSuccessfulRegistryFetchTimePeriodInternal() {
-        final long delay = (!clientConfig.shouldFetchRegistry() || isShutdown.get())
-            ? 0
-            : getLastSuccessfulRegistryFetchTimePeriod();
-
-        registryStalenessMonitor.update(computeStalenessMonitorDelay(delay));
-        return delay;
-    }
-
-    @com.netflix.servo.annotations.Monitor(name = METRIC_REGISTRY_PREFIX + "localRegistrySize",
-            description = "Count of instances in the local registry", type = DataSourceType.GAUGE)
-    public int localRegistrySize() {
-        return registrySize;
-    }
-
-
-    private long computeStalenessMonitorDelay(long delay) {
-        if (delay < 0) {
-            return System.currentTimeMillis() - initTimestampMs;
-        } else {
-            return delay;
-        }
-    }
-
-    /**
-     * Gets stats for the DiscoveryClient.
-     *
-     * @return The DiscoveryClientStats instance.
-     */
-    public Stats getStats() {
-        return stats;
-    }
-
-    /**
-     * Stats is used to track useful attributes of the DiscoveryClient. It includes helpers that can aid
-     * debugging and log analysis.
-     */
-    public class Stats {
-
-        private Stats() {}
-
-        public int initLocalRegistrySize() {
-            return initRegistrySize;
-        }
-
-        public long initTimestampMs() {
-            return initTimestampMs;
-        }
-
-        public int localRegistrySize() {
-            return registrySize;
-        }
-
-        public long lastSuccessfulRegistryFetchTimestampMs() {
-            return lastSuccessfulRegistryFetchTimestamp;
-        }
-
-        public long lastSuccessfulHeartbeatTimestampMs() {
-            return lastSuccessfulHeartbeatTimestamp;
-        }
-
-        /**
-         * Used to determine if the Discovery client's first attempt to fetch from the service registry succeeded with
-         * non-empty results.
-         *
-         * @return true if succeeded, failed otherwise
-         */
-        public boolean initSucceeded() {
-            return initLocalRegistrySize() > 0 && initTimestampMs() > 0;
-        }
-
-    }
-
 }
